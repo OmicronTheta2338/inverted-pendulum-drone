@@ -172,13 +172,15 @@ PWM values are 1000–2000 µs. `frame_count` increments every output step; the 
 
 ## Decision
 
-**Status:** Undecided — research complete, awaiting written decision
+**Status:** DECIDED — 2026-05-31
 
-**Chosen path:** *(Custom / ArduPilot)*
+**Chosen path:** ArduPilot
 
 **Justification:**
 
-*(Write the decision here.)*
+Everything time-consuming in a flight stack — ESC/DShot output timing, IMU filtering (lowpass + RPM notch), attitude/state estimation, EKF, failsafes, tuning infrastructure — is inherited from ArduPilot rather than built from scratch. The `AP_Motors6DOF` class already supports our exact need: lateral force as a first-class command axis, with `add_motor_raw_6dof()` accepting per-motor throttle, forward, and lateral factors alongside the rotational axes. Two existing 8-motor `VECTORED_6DOF` configurations give us a template to start from. The SITL JSON bridge is fully documented and ready to connect to Godot. None of this would exist on a from-scratch path.
+
+The only non-trivial ArduPilot-specific work is deriving the 8-motor factor matrix for our cant angle and arm geometry — but that's a Phase 1 task regardless of which path we chose.
 
 **How lateral force is represented in the chosen stack:**
 
@@ -202,7 +204,7 @@ The pendulum outer loop sits above this: it commands a desired lateral accelerat
 
 ---
 
-## Phase 0 checkpoint: PASS / FAIL
+## Phase 0 checkpoint: PASS ✓
 
-- [ ] Written decision with justification recorded above
-- [ ] Lateral force representation confirmed and documented
+- [x] Written decision with justification recorded above
+- [x] Lateral force representation confirmed and documented

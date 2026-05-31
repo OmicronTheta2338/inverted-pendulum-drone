@@ -4,6 +4,22 @@ A segmented build plan for a octacopter (4 upright motors + 4 canted lateral mot
 
 **Guiding principles:** every phase ends in a checkpoint with explicit pass criteria; nothing physical is committed until its design is validated in simulation; the same flight code runs in sim and on hardware to avoid divergence.
 
+[ ] Phase 1 - Initial layout & analytical performance budget
+[ ] Phase 2 — Rough parametric CAD skeleton
+[ ] Phase 3 — Drone physics in simulation (no pendulum)
+[ ] Phase 4 — Sensor noise model
+[ ] Phase 5 — Drone flying in simulation
+[ ] Phase 6 — Order parts
+[ ] Phase 7 — Single pendulum in simulation (physics first)
+[ ] Phase 8 — Single pendulum controller
+[ ] Phase 9 — Two pendulum arms in simulation
+[ ] Phase 10 — Full-detail CAD
+[ ] Phase 11 — PLA prototype build & basic control test
+[ ] Phase 12 — CF / machined / TPU build & validation
+[ ] Phase 13 — Single arm on hardware
+[ ] Phase 14 — Two arms on hardware
+
+
 ---
 
 ## Phase 0 — Flight controller architecture decision
