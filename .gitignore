@@ -1,0 +1,17 @@
+# ArduPilot SITL runtime artifacts (large / regenerable) -- the UDP-bridge path
+sitl/logs/
+sitl/autotest/out/
+sitl/eeprom.bin
+sitl/mav.tlog
+sitl/terrain/
+sitl/dumpstack.sh_*.out
+
+# native standalone test binary (not covered by native/.gitignore)
+native/tests/test_flightstack
+
+# editor / OS junk
+*.kate-swp
+.*.kate-swp
+
+# stray accidental file
+claude --resume*
