@@ -1,0 +1,12 @@
+# cloned build dependency -- re-clone per Balance-Controller-Design.md §7:
+#   git clone --depth 1 --branch 4.5 https://github.com/godotengine/godot-cpp.git native/godot-cpp
+godot-cpp/
+
+# build artifacts
+*.os
+*.o
+*.obj
+*.so
+.sconsign.dblite
+compile_commands.json
+tests/test_plant
