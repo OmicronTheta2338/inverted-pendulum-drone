@@ -34,9 +34,13 @@ static constexpr float ACCEL_FF_TAU  = 0.008f;  // fast FF reference low-pass
 static constexpr float ACCEL_FB_DELAY = 0.015f; // feedback-ref delay (~a_meas lag)
 static constexpr float ACCEL_DRAG_K_LAT = 0.05f;// lateral drag-cancel FF (<= true drag coeff)
 
-static constexpr float PEND_MASS_RATIO = 0.10f; // bob / drone-body mass
-static constexpr float PEND_L          = 0.60f; // pivot->bob length [m]
-static constexpr float PEND_PREDICT_S  = 0.042f;// predict arm state fwd by ~loop delay
+static constexpr float PEND_MASS_RATIO = 0.10f; // bob1 / drone-body mass (series link 1)
+static constexpr float PEND_M2_R       = 0.10f; // bob2 / drone-body mass (series link 2)
+static constexpr float PEND_L          = 0.60f; // legacy single-link length (= PEND_L1)
+static constexpr float PEND_L1         = 0.60f; // link1: pivot -> bob1 length [m]
+static constexpr float PEND_L2         = 0.60f; // link2: bob1  -> bob2 length [m]
+static constexpr float PEND_PREDICT_S  = 0.0f;  // Smith horizon: 0 = off. >0 helps lat but destabilises the
+                                                // vertical near aligned links (dd stiffens) -> tune in Packet D.
 
 static constexpr float PARK_ALT_M   = 10.0f;
 static constexpr float PARK_KP_POS  = 1.0f;
@@ -196,22 +200,56 @@ void ModeAccel::run(const AccelInput &in, const AhrsState &ahrs, bool on_ground,
         _up_ref_ff = 0.0f;
     }
 
-    // ---- pendulum reaction-force feed-forward (0/1/2 hanging arms) ----
+    // ---- pendulum reaction-force feed-forward: SERIES chain (0/1/2 links) ----
+    // The chain loads the drone through link-1's root hinge ONLY. Reaction on the cart:
+    //     R = sum_i m_i (g_vec - a_bob_i)        (isolate the chain; Newton's 3rd law)
+    // Each bob's acceleration comes from the chain kinematics; the two links' angular
+    // accelerations (dd1, dd2) come from the coupled double-pendulum EOM under effective
+    // gravity g_eff = g_vec - a_d. The FF adds -R/m_d to cancel it. Masses are ratios
+    // (m_i / m_d), so R is already an acceleration. A single link (n=1, m2=0) reduces
+    // EXACTLY to the old along-rod form. [Derivation: plan appendix "Packet C (double)".]
     {
-        const int n_arms = constrain_int(in.n_arms, 0, 2);
-        const float w_lat = lat_ref_fb;                 // (a_d - g_vec)_lateral
-        const float w_up  = up_ref_fb + GRAVITY_MSS;    // (a_d - g_vec)_up
+        const int n = constrain_int(in.n_arms, 0, 2);
         float a_pend_lat = 0.0f, a_pend_up = 0.0f;
-        for (int i = 0; i < n_arms; i++) {
-            const float theta0 = in.theta[i];
-            const float rate0  = in.theta_dot[i];
-            const float th_ddot = (-w_lat * cosf(theta0) - w_up * sinf(theta0)) / PEND_L;
-            const float theta = theta0 + rate0 * PEND_PREDICT_S + 0.5f * th_ddot * PEND_PREDICT_S * PEND_PREDICT_S;
-            const float rate  = rate0 + th_ddot * PEND_PREDICT_S;
-            const float su = sinf(theta), cu = -cosf(theta);   // u = (sinθ, -cosθ)
-            const float mag = PEND_MASS_RATIO * ((w_lat * su + w_up * cu) - PEND_L * rate * rate);
-            a_pend_lat += mag * su;
-            a_pend_up  += mag * cu;
+        if (n > 0) {
+            const float gx = -(lat_ref_fb);                 // g_eff lateral = -(a_d)_lat
+            const float gy = -(up_ref_fb + GRAVITY_MSS);    // g_eff up      = -((a_d)_up + g)
+            const float m1 = PEND_MASS_RATIO;
+            const float m2 = (n >= 2) ? PEND_M2_R : 0.0f;
+            const float M  = m1 + m2;
+            const float L1 = PEND_L1, L2 = PEND_L2;
+            // coupled EOM solver under g_eff: (angles, rates) -> angular accels (d1, d2)
+            auto solve = [&](float t1, float t2, float o1, float o2, float &d1, float &d2) {
+                const float c1 = cosf(t1), s1 = sinf(t1), c2 = cosf(t2), s2 = sinf(t2);
+                const float dD = t1 - t2, cD = cosf(dD), sD = sinf(dD);
+                const float b1 = M * (gx * c1 + gy * s1) - m2 * L2 * sD * o2 * o2;
+                const float b2 = (gx * c2 + gy * s2) + L1 * sD * o1 * o1;
+                const float det = L1 * L2 * (M - m2 * cD * cD);   // = L1 L2 (m1 + m2 sinD^2) > 0
+                d1 = (L2 * b1 - m2 * L2 * cD * b2) / det;
+                d2 = (n >= 2) ? (-L1 * cD * b1 + M * L1 * b2) / det : 0.0f;
+            };
+            float th1 = in.theta[0], w1 = in.theta_dot[0];
+            float th2 = (n >= 2) ? in.theta[1] : 0.0f;
+            float w2  = (n >= 2) ? in.theta_dot[1] : 0.0f;
+            // Smith-predict the chain forward by the loop delay so the FF matches the state
+            // WHEN the commanded accel is actually realised (native ~PEND_PREDICT_S).
+            const float T = PEND_PREDICT_S;
+            float dd1, dd2;
+            solve(th1, th2, w1, w2, dd1, dd2);
+            th1 += w1 * T + 0.5f * dd1 * T * T;  w1 += dd1 * T;
+            th2 += w2 * T + 0.5f * dd2 * T * T;  w2 += dd2 * T;
+            solve(th1, th2, w1, w2, dd1, dd2);   // re-evaluate at the predicted state
+            // reaction on the cart at the predicted state; u=(sin,-cos), u_perp=(cos,sin)
+            const float c1 = cosf(th1), s1 = sinf(th1);
+            const float c2 = cosf(th2), s2 = sinf(th2);
+            float R_lat = M * gx - M * L1 * (dd1 * c1 - w1 * w1 * s1);
+            float R_up  = M * gy - M * L1 * (dd1 * s1 + w1 * w1 * c1);
+            if (n >= 2) {
+                R_lat -= m2 * L2 * (dd2 * c2 - w2 * w2 * s2);
+                R_up  -= m2 * L2 * (dd2 * s2 + w2 * w2 * c2);
+            }
+            a_pend_lat = -R_lat;    // add the negative of the disturbance to cancel it
+            a_pend_up  = -R_up;
         }
         a_lat_out += a_pend_lat;
         a_up_out  += a_pend_up;
