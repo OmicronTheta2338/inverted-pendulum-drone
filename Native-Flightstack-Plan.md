@@ -398,7 +398,7 @@ hardware-transfer concern, recorded below, not simulated.
 | position NED | 0.02 m + random-walk 0.05 m/√s | 20 ms | **IMU-only** dead reckoning — no GPS/vision (short flights) |
 | arm-1 angle θ₀ | 0.15° | **8 ms** | 2×IMU fused attitude: drift-bounded, maneuver-coupled |
 | arm-1 rate θ̇₀ | 0.4 °/s | 2.5 ms | differential gyro — clean; **the RHP-critical channel** |
-| arm-2 angle θ₁ | 0.10° + LSB 0.05° | 2.5 ms | magnetic encoder (~13-bit), clean |
+| arm-2 **relative** φ=θ₂−θ₁ | 0.10° + LSB 0.05° | 2.5 ms | magnetic encoder (~13-bit) *over the joint*; link2 absolute = θ₁(IMU)+φ, so it **inherits link1's 0.15° / 8 ms** |
 | arm-2 rate θ̇₁ | 1.0 °/s | 2.5 ms | differentiated encoder, noisier |
 
 **Env knobs:** `USE_SENSOR_NOISE`, `SENSOR_SEED`, `SENSOR_POS_DRIFT`,
@@ -441,8 +441,11 @@ an RHP pole *in the loop* — that only exists once the balance controller close
 2. **Velocity drift** is folded into the position random-walk (no explicit velocity-drift channel).
    If Packet D is velocity-sensitive, add one — or add **optical flow** (a velocity sensor, hitting
    the IMU's weakest channel) rather than a position sensor.
-3. **Arm-2 absolute angle inherits arm-1 drift** (the encoder is a *relative* joint measurement).
-   Omitted — `truth["theta1"]` is fed absolute. Add if the double-arm estimate looks fragile.
+3. **Arm-2 absolute angle inherits arm-1's error** — ✅ **now modelled (2026-07-11, for the series chain).**
+   The encoder is a *relative* joint measurement (φ = θ₂−θ₁); link2's absolute angle/rate are
+   reconstructed as θ₁(IMU, 8 ms) + φ(encoder, 2.5 ms), sharing the same θ₁ sample, so link2 carries
+   link1's ~0.15° noise + 8 ms latency (`main.gd:_sensed_state`). Effect: honest sensing ~doubles the
+   double-pendulum reaction-FF error (lat 0.53→0.85 RMS, seed 1) — sensor quality bites here.
 4. **Maneuver-coupled arm-1 angle error** (the accel gravity anchor tilting under catch accel) is
    *not* modelled — only its extra fusion **latency** (8 ms) is. **This is the #1 thing to add if
    Packet D balance is fragile**, since the error is a transient angle *bias* correlated with the

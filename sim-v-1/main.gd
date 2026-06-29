@@ -579,18 +579,21 @@ func _sensed_state(truth: Dictionary, dt: float) -> Dictionary:
 	# fusion LATENCY is (read back at _d_arm_imu below). Revisit at hardware / if Packet D is fragile.
 	var th0: float = float(truth["theta0"]) + g.randfn() * (sig_theta0_deg * d2r)
 	var td0: float = float(truth["tdot0"]) + g.randfn() * (sig_thetadot0_dps * d2r)
-	# arm 2 (distal): magnetic encoder -> quantize angle to LSB then add noise; differentiated rate.
-	# NOTE (documented simplification): arm-2's ABSOLUTE angle inherits arm-1's drift (encoder is a
-	# RELATIVE joint measurement); truth["theta1"] is fed absolute here, so that coupling is omitted.
+	# arm 2 (distal): the magnetic encoder sits OVER THE JOINT, so it measures the RELATIVE angle
+	# phi = theta2 - theta1 (known "exactly", to the LSB), NOT theta2 absolute. Link2 carries no
+	# inertial sensor of its own, so its ABSOLUTE angle/rate are reconstructed on read-back (below) as
+	# theta1(IMU) + phi(encoder) -- so link2 correctly INHERITS link1's IMU noise + 8 ms fusion latency,
+	# with only the clean relative encoder on top. (rate: link1 gyro + differentiated encoder.)
 	var lsb := deg_to_rad(enc_lsb_deg)
-	var th1_q: float = (round(float(truth["theta1"]) / lsb) * lsb if lsb > 0.0 else float(truth["theta1"]))
-	var th1: float = th1_q + g.randfn() * (sig_theta1_deg * d2r)
-	var td1: float = float(truth["tdot1"]) + g.randfn() * (sig_thetadot1_dps * d2r)
+	var phi_true: float = float(truth["theta1"]) - float(truth["theta0"])
+	var phi_q: float = (round(phi_true / lsb) * lsb if lsb > 0.0 else phi_true)
+	var phi: float = phi_q + g.randfn() * (sig_theta1_deg * d2r)
+	var phidot: float = (float(truth["tdot1"]) - float(truth["tdot0"])) + g.randfn() * (sig_thetadot1_dps * d2r)
 
 	var snap := {
 		"accel_ef": accel_n, "gyro": gyro_n, "quat": quat_n,
 		"vel_ned": vel_n, "pos_ned": pos_n,
-		"theta0": th0, "theta1": th1, "tdot0": td0, "tdot1": td1,
+		"theta0": th0, "phi": phi, "tdot0": td0, "phidot": phidot,
 	}
 	if not _sensor_seeded:
 		for i in range(_sb_len):
@@ -598,17 +601,22 @@ func _sensed_state(truth: Dictionary, dt: float) -> Dictionary:
 		_sensor_seeded = true
 	_hist[_sb_idx] = snap
 
-	# read each channel at its own latency (ring depth); advance the write index afterward
+	# read each channel at its own latency (ring depth); advance the write index afterward.
+	# arm-1 (link1) absolute: 2xIMU fusion (deep, EKF-att-like latency) + differential gyro rate.
+	var th0r: float = _read_ch("theta0", _d_arm_imu)
+	var td0r: float = _read_ch("tdot0", _d_arm)
 	var out := {
 		"accel_ef": _read_ch("accel_ef", _d_imu),
 		"gyro":     _read_ch("gyro", _d_imu),
 		"quat":     _read_ch("quat", _d_att),
 		"vel_ned":  _read_ch("vel_ned", _d_vel),
 		"pos_ned":  _read_ch("pos_ned", _d_pos),
-		"theta0":   _read_ch("theta0", _d_arm_imu),   # arm-1 fused angle: deeper (EKF-att-like) latency
-		"theta1":   _read_ch("theta1", _d_arm),        # arm-2 encoder: clean, ~loop-rate
-		"tdot0":    _read_ch("tdot0", _d_arm),         # arm-1 differential gyro: clean rate
-		"tdot1":    _read_ch("tdot1", _d_arm),         # arm-2 differentiated encoder
+		"theta0":   th0r,
+		"tdot0":    td0r,
+		# arm-2 (link2) ABSOLUTE = link1(IMU, 8 ms) + relative encoder(clean, ~loop-rate): link2 inherits
+		# link1's noise + latency (shared th0r sample -> errors are correlated, as on the real vehicle).
+		"theta1":   th0r + _read_ch("phi", _d_arm),
+		"tdot1":    td0r + _read_ch("phidot", _d_arm),
 	}
 	_sb_idx = (_sb_idx + 1) % _sb_len
 	return out
