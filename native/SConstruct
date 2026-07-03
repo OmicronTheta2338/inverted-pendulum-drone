@@ -9,6 +9,13 @@ import os
 
 env = SConscript("godot-cpp/SConstruct")
 
+# This machine ships only the SHARED libstdc++/libgcc (no 64-bit static .a), so godot-cpp's default
+# "-static-libgcc -static-libstdc++" link flags fail. Drop them and link the shared libs instead
+# (fine for the local sim; the .so already depends on the system runtime).
+for _flag in ("-static-libgcc", "-static-libstdc++"):
+    while _flag in env["LINKFLAGS"]:
+        env["LINKFLAGS"].remove(_flag)
+
 env.Append(CPPPATH=["src/"])
 sources = Glob("src/*.cpp")
 
