@@ -11,9 +11,9 @@ static constexpr float ACCEL_LAT_MAX_MSS_NEG_A = 40.6f;   // magnitude-scheduled
 static constexpr float ACCEL_LAT_MAX_MSS_NEG_B = 0.25f;
 static constexpr float ACCEL_LAT_CMD_MSS       = 12.0f;   // accel at full lateral stick
 
-static constexpr float ACCEL_FWD_KP  = 1.5f;    // forward-hold: -KP*x -KD*v -KI*int
-static constexpr float ACCEL_FWD_KD  = 2.5f;
-static constexpr float ACCEL_FWD_KI  = 0.5f;
+static constexpr float ACCEL_FWD_KP  = 0.5f;    // forward-hold: -KP*x -KD*v -KI*int. Softened from 1.5/2.5/0.5:
+static constexpr float ACCEL_FWD_KD  = 1.3f;    // the old set was lightly damped through the slow pitch loop, so
+static constexpr float ACCEL_FWD_KI  = 0.2f;    // noisy EKF pos/vel rang up a growing fore/aft oscillation (Packet D).
 static constexpr float ACCEL_FWD_IMAX    = 1.0f;
 static constexpr float ACCEL_FWD_MAX_MSS = 2.5f;
 
@@ -36,8 +36,8 @@ static constexpr float ACCEL_DRAG_K_LAT = 0.05f;// lateral drag-cancel FF (<= tr
 
 static constexpr float PEND_MASS_RATIO = 0.10f; // bob1 / drone-body mass (series link 1)
 static constexpr float PEND_M2_R       = 0.10f; // bob2 / drone-body mass (series link 2)
-static constexpr float PEND_L          = 0.60f; // legacy single-link length (= PEND_L1)
-static constexpr float PEND_L1         = 0.60f; // link1: pivot -> bob1 length [m]
+static constexpr float PEND_L          = 0.70f; // legacy single-link length (= PEND_L1)
+static constexpr float PEND_L1         = 0.70f; // link1: pivot -> bob1 length [m]
 static constexpr float PEND_L2         = 0.60f; // link2: bob1  -> bob2 length [m]
 static constexpr float PEND_PREDICT_S  = 0.0f;  // Smith horizon: 0 = off. >0 helps lat but destabilises the
                                                 // vertical near aligned links (dd stiffens) -> tune in Packet D.
