@@ -1,0 +1,123 @@
+[gd_scene format=3 uid="uid://bn4xgrw46m62g"]
+
+[ext_resource type="Script" uid="uid://bionm28qrkmsw" path="res://balance2_test.gd" id="1_bal2"]
+[ext_resource type="Script" uid="uid://chsh7a0t48jgh" path="res://accel_graph.gd" id="2_graph"]
+
+[sub_resource type="BoxMesh" id="BoxMesh_drone"]
+size = Vector3(0.35, 0.06, 0.35)
+
+[sub_resource type="SphereShape3D" id="SphereShape3D_bob"]
+radius = 0.02
+
+[sub_resource type="StandardMaterial3D" id="Mat_rod1"]
+albedo_color = Color(0.23, 0.52, 1, 1)
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_rod1"]
+top_radius = 0.008
+bottom_radius = 0.008
+height = 0.7
+
+[sub_resource type="StandardMaterial3D" id="Mat_rod2"]
+albedo_color = Color(0.9, 0.22, 0.24, 1)
+
+[sub_resource type="CylinderMesh" id="CylinderMesh_rod2"]
+top_radius = 0.008
+bottom_radius = 0.008
+height = 0.6
+
+[node name="BalanceTest2" type="Node3D" unique_id=81267619]
+script = ExtResource("1_bal2")
+
+[node name="Drone" type="RigidBody3D" parent="." unique_id=1759908364]
+mass = 0.8
+center_of_mass_mode = 1
+inertia = Vector3(0.01616, 0.04272, 0.02674)
+
+[node name="DroneMesh" type="MeshInstance3D" parent="Drone" unique_id=1019096587]
+mesh = SubResource("BoxMesh_drone")
+
+[node name="Link1" type="RigidBody3D" parent="." unique_id=750230080]
+transform = Transform3D(-1, 0, 0, 0, -1, 0, 0, 0, 1, 0, 0, 0)
+collision_layer = 0
+collision_mask = 0
+mass = 0.1
+can_sleep = false
+linear_damp_mode = 1
+angular_damp_mode = 1
+
+[node name="Bob1" type="CollisionShape3D" parent="Link1" unique_id=1678360525]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.7, 0)
+shape = SubResource("SphereShape3D_bob")
+
+[node name="Rod1" type="MeshInstance3D" parent="Link1" unique_id=1068666304]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.35, 0)
+material_override = SubResource("Mat_rod1")
+mesh = SubResource("CylinderMesh_rod1")
+
+[node name="Hinge1" type="HingeJoint3D" parent="." unique_id=571520762]
+node_a = NodePath("../Drone")
+node_b = NodePath("../Link1")
+
+[node name="Link2" type="RigidBody3D" parent="." unique_id=962983391]
+transform = Transform3D(-1, 0, 0, 0, -1, 0, 0, 0, 1, 0, 0.7, 0)
+collision_layer = 0
+collision_mask = 0
+mass = 0.1
+can_sleep = false
+linear_damp_mode = 1
+angular_damp_mode = 1
+
+[node name="Bob2" type="CollisionShape3D" parent="Link2" unique_id=288298866]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.6, 0)
+shape = SubResource("SphereShape3D_bob")
+
+[node name="Rod2" type="MeshInstance3D" parent="Link2" unique_id=1328489131]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.3, 0)
+material_override = SubResource("Mat_rod2")
+mesh = SubResource("CylinderMesh_rod2")
+
+[node name="Hinge2" type="HingeJoint3D" parent="." unique_id=130261652]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.7, 0)
+node_a = NodePath("../Link1")
+node_b = NodePath("../Link2")
+
+[node name="Camera3D" type="Camera3D" parent="." unique_id=1438309236]
+transform = Transform3D(1, 0, 0, 0, 0.96790683, 0.25130925, 0, -0.25130925, 0.96790683, 0, 0.42895293, 3.2)
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=447107505]
+transform = Transform3D(1, 0, 0, 0, 0.7071, 0.7071, 0, -0.7071, 0.7071, 0, 3, 0)
+
+[node name="CanvasLayer" type="CanvasLayer" parent="." unique_id=289761098]
+
+[node name="Status" type="Label" parent="CanvasLayer" unique_id=1434919208]
+offset_left = 12.0
+offset_top = 12.0
+offset_right = 620.0
+offset_bottom = 210.0
+theme_override_font_sizes/font_size = 16
+
+[node name="GraphU" type="Control" parent="CanvasLayer" unique_id=1450257087]
+layout_mode = 3
+anchors_preset = 12
+anchor_top = 1.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 10.0
+offset_top = -318.0
+offset_right = -10.0
+offset_bottom = -166.0
+mouse_filter = 2
+script = ExtResource("2_graph")
+
+[node name="GraphAng" type="Control" parent="CanvasLayer" unique_id=2055978910]
+layout_mode = 3
+anchors_preset = 12
+anchor_top = 1.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_left = 10.0
+offset_top = -158.0
+offset_right = -10.0
+offset_bottom = -6.0
+mouse_filter = 2
+script = ExtResource("2_graph")

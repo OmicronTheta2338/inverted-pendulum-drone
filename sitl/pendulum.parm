@@ -1,0 +1,93 @@
+# Pendulum octocopter — SITL tuning (load every boot)
+#   In MAVProxy:  param load pendulum.parm
+#   Or at launch: sim_vehicle.py ... --add-param-file=pendulum.parm
+#
+# BOOT / ARM SEQUENCE (these are timing, NOT params — don't try to skip them):
+#   1. param load pendulum.parm
+#   2. WAIT ~20-30s: until "Main loop slow" stops AND GPS locks.
+#      ("Need Position Estimate" just means GPS hasn't locked yet — LOITER
+#       needs a position fix by definition; you cannot param it away.)
+#   3. rc 3 1000          (throttle down, or "Throttle too high")
+#   4. mode LOITER        (or arm in ALT_HOLD first, switch to LOITER airborne)
+#   5. arm throttle
+#   6. rc 3 1500          (mid = hold alt; roll/pitch centered = hold position)
+#
+# --- bridge / timing ---
+# All three physics clocks MUST agree or lockstep reports "Main loop slow":
+#   Godot common/physics_ticks_per_second (project.godot) == SCHED_LOOP_RATE == SIM_RATE_HZ
+# SIM_RATE_HZ defaults to 1200 (built-in copter physics); with the external Godot
+# JSON backend delivering frames at 200 Hz, that 6x mismatch makes lockstep think
+# the backend is perpetually behind and the achieved loop rate collapses to ~150 Hz
+# (logged as "PreArm: Main loop slow (151Hz < 200Hz)" -> can't arm). Match it to Godot.
+SCHED_LOOP_RATE 200
+SIM_RATE_HZ 200
+# --- arming: skip INS check (gyro rate unsatisfiable in JSON lockstep; bit4=16) ---
+ARMING_SKIPCHK 16
+# --- auto-disarm: 0 = never auto-disarm (default 10s after it thinks it landed).
+#     Stops the motors dropping out while you fiddle on the ground / between tests. ---
+DISARM_DELAY 0
+# --- motor thrust model: match the sim's LINEAR thrust ---
+#   Hover throttle MEASURED from CTUN.ThO at steady hover (log 43) = 0.069, NOT 0.10
+#   (~1100 PWM = 0.069 thr after MOT_SPIN_MIN scaling; the old "0.10" was a bad
+#   PWM->throttle conversion). pos_control's integrator made 0.10 work anyway, but
+#   0.069 is correct and reduces the alt-hold trim error.
+MOT_SPIN_ARM 0.03
+MOT_SPIN_MIN 0.05
+MOT_THST_EXPO 0.35
+MOT_THST_HOVER 0.069
+# --- rate loop: airframe is ~10x twitchier than default copter (low inertia, 10:1 T/W) ---
+ATC_RAT_RLL_P 0.015
+ATC_RAT_RLL_I 0.015
+ATC_RAT_RLL_D 0.001
+ATC_RAT_PIT_P 0.015
+ATC_RAT_PIT_I 0.015
+ATC_RAT_PIT_D 0.001
+# yaw was left at stock (0.18 = 12x roll/pitch) -> canted motors (the yaw actuator)
+# slammed full-range 1050<->1950 at 2Hz once the motor lag added phase delay. Cut ~9x.
+ATC_RAT_YAW_P 0.02
+ATC_RAT_YAW_I 0.002
+ATC_RAT_YAW_D 0.0
+# --- vertical loop: same 10x-too-hot problem as attitude. Throttle->accel gain
+#     is ~96 m/s^2 (10:1 T/W) so stock PSC_D_ACC_P=0.05 gives loop gain ~4.8 ->
+#     bang-bang limit cycle (throttle slams 0<->0.14). Cut accel gains ~10x. ---
+PSC_D_ACC_P 0.005
+PSC_D_ACC_I 0.02
+# NOTE: vertical felt laggy mainly because of PILOT_ACC_Z (default 2.5 m/s^2 clamps how
+# fast the alt controller builds climb accel) + PSC_JERK_D. To make climb snappier raise
+# them (e.g. PILOT_ACC_Z 10-15, PSC_JERK_D 30) -- left at defaults here for the baseline.
+# stop hover-throttle mis-learning off the limit cycle during tuning (0=disabled)
+MOT_HOVER_LEARN 0
+# --- LOITER feel for manual keyboard control (NOT comms latency) ---
+#   LOIT_BRK_DELAY 1.0 = it COASTS for a full second after you release a key
+#     before braking -> the "keeps going then settles later". Set 0.
+#   LOIT_SPEED 12.5 m/s is race-pace; drop to 3 so a key tap is gentle.
+#   Brake harder/snappier so it stops promptly when you let go.
+LOIT_BRK_DELAY 0
+LOIT_SPEED_MS 3.0
+LOIT_BRK_ACC_M 5.0
+LOIT_BRK_JRK_M 10.0
+# --- rig controller (rig_controller.lua, GUIDED): open the kinematic limits so
+#     lateral dart is real. GUIDED posvelaccel targets are gated by the WP_* nav
+#     params (confirmed in mode_guided.cpp: horizontal WP_SPD/WP_ACC, vertical
+#     WP_SPD_UP/WP_SPD_DN/WP_ACC_Z). They default WAY below this airframe's
+#     ~48 m/s^2 lateral capacity. Start modest and raise once it tracks cleanly;
+#     the cap is the controller's, not the airframe's.
+#
+#   NOTE — this build renamed/SI-converted WPNav: prefix is WP_ (not WPNAV_) and
+#   values are SI (m/s, m/s^2), NOT cm. The old WPNAV_SPEED 500 etc. would load
+#   as UNKNOWN PARAMS and silently leave GUIDED clamped at defaults.
+#
+#   Must exceed MAX_LAT_VEL (4.0) / MAX_VERT_VEL (1.5) in the script. WP_ACC's
+#   advisory @Range tops at 5 but param set isn't clamped — 12 is accepted.
+#   (NOTE: this loader rejects inline comments — keep value lines bare.)
+#   WP_SPD   horiz speed cap, m/s    (> MAX_LAT_VEL 4.0)
+#   WP_ACC   horiz accel cap, m/s^2  (airframe can do ~48; raise later)
+#   WP_JERK  horiz jerk, m/s^3       (smoothness vs snap)
+#   WP_SPD_UP/DN  vertical speed caps, m/s  (> MAX_VERT_VEL 1.5)
+#   WP_ACC_Z vertical accel cap, m/s^2  (momentary up/down headroom) ---
+WP_SPD 5
+WP_ACC 12
+WP_JERK 20
+WP_SPD_UP 2.5
+WP_SPD_DN 2.5
+WP_ACC_Z 5

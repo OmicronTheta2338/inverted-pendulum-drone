@@ -32,13 +32,26 @@ The drone must be able to arrest a small perturbation within this timescale, so 
 
 > **Decision needed:** Choose arm length L before proceeding. This is the single most consequential geometry decision in Phase 1.
 
-**Chosen arm length:** *(fill in)*
+**Chosen arm length:** **0.60 m primary, 0.50 m secondary** (the shorter secondary arm allows full range of motion of the primary). The **0.50 m arm is the binding axis** — it diverges fastest.
 
-**Divergence timescale τ:** *(fill in)*
+**Divergence timescale τ:** **0.247 s** (0.60 m) / **0.226 s** (0.50 m). Unstable pole 1/τ = 4.04 rad/s (0.64 Hz) and 4.43 rad/s (0.70 Hz) respectively.
 
-**Minimum lateral bandwidth target:** > *(fill in)* Hz (rule of thumb: closed-loop bandwidth ≥ 3–5 × 1/τ)
+**Minimum lateral bandwidth target:** **> ~3 Hz** (3–5 × the 0.70 Hz binding pole → 2.1–3.5 Hz).
 
-**Minimum lateral acceleration target (for step response within τ):** *(fill in)* m/s²
+**Minimum lateral acceleration target (for step response within τ):** **~5 m/s² (≈0.5 g)** — enough to hold a ~27° lean (a = g·tan θ). Bandwidth, not accel, is the binding constraint; accel headroom is enormous.
+
+### Validation (sim step test, 2026-06-26)
+
+Measured in `main.gd` `_run_lateral_test` (attitude frozen level, canted motors stepped to full lateral → pure actuator response, control-loop-independent):
+
+| Metric | Demand | Measured | Margin |
+|---|---|---|---|
+| Peak lateral accel | ~5 m/s² | **48.2 m/s² (4.92 g)** | **~10×** |
+| Lateral bandwidth | ≥ ~3 Hz | **~5.3 Hz** (first-order τ ≈ 30 ms, −3 dB) | **~7–8×** over the 0.70 Hz pole |
+
+Step response is clean first-order: 56.6% at 25 ms, 84% at 55 ms, ~full (4.92 g) by 125 ms → time constant **τ ≈ 30 ms = MOTOR_TAU**. **PASS on both axes.**
+
+> Caveat: 5.3 Hz is the *actuator-only* ceiling (motor spin-up alone, attitude frozen); the closed-loop balance controller lives below it. `MOTOR_TAU = 0.03 s` is still an estimate — bench-measure it (step throttle, time to 63%) to firm up the margin.
 
 ---
 
@@ -113,20 +126,22 @@ Hover margin check: (4 × T_motor × cos(θ) + 4 × T_motor) ≥ m_total × g
 
 > If this fails at your chosen θ and mass, either reduce mass, increase motor count/size, or reduce cant angle.
 
-### Cant angle calculation (fill in once motors and mass are known)
+### Cant angle calculation
+
+> Note: the airframe uses **opposing canted pairs** (M5/M8 push −X, M6/M7 push +X), so only **2** motors thrust in any one lateral direction — `F_lateral_max = 2 × T × sin θ`, not 4×.
 
 | Variable | Value |
 |---|---|
-| T_motor (max, N) | |
-| m_total (kg) | |
-| θ (chosen) | |
-| F_lateral_max (N) | |
-| a_lateral_max (m/s²) | |
-| Hover headroom at max lateral thrust | |
-| Target a_lateral from pendulum demand | |
-| Margin | |
+| T_motor (max, N) | 19.3 (F60PROV-LV 1950KV, 1966 g) |
+| m_total (kg) | ~0.80 (sim) / 0.85 (numbers doc) |
+| θ (chosen) | **90°** |
+| F_lateral_max (N) | 2 × 19.3 × sin 90° = 38.6 |
+| a_lateral_max (m/s²) | 38.6 / 0.80 = **48.2 (4.92 g)** ✓ matches step test |
+| Hover headroom at max lateral thrust | 4 uprights only: 77.2 N / 7.84 N = **9.8:1** |
+| Target a_lateral from pendulum demand | ~5 m/s² |
+| Margin | **~10×** |
 
-**Chosen cant angle:** *(fill in)*
+**Chosen cant angle: 90°.** Justified *because of this airframe's T/W*: at 90° the canted motors contribute zero vertical lift (cos 90° = 0), so hover rests entirely on the 4 upright motors — and those alone give 9.8:1. A normal-T/W airframe would need a shallower cant (e.g. 30–45°) to keep hover headroom; ours does not. 90° also maximises lateral authority per motor and keeps the mixer clean (canted thrust is purely lateral, zero vertical coupling).
 
 ---
 
@@ -267,26 +282,26 @@ yaw_fac      = ±small (reaction torque from prop, plus small geometric term)
 
 ## Step 8 — Summary of key numbers
 
-*(Fill in once all steps above are complete.)*
-
 | Metric | Value | Passes? |
 |---|---|---|
-| Total mass | kg | — |
-| Cant angle | ° | — |
-| Peak lateral acceleration | m/s² | |
-| Pendulum divergence timescale τ | s | — |
-| Lateral bandwidth target | Hz | — |
-| Lateral accel margin above pendulum demand | m/s² | ✓ / ✗ |
-| Hover headroom at max lateral thrust | % | ✓ / ✗ |
+| Total mass | ~0.80–0.85 kg | — |
+| Cant angle | 90° | — |
+| Peak lateral acceleration | 48.2 m/s² (4.92 g) | — |
+| Pendulum divergence timescale τ | 0.226 s (0.50 m, binding) / 0.247 s (0.60 m) | — |
+| Lateral bandwidth | ~5.3 Hz actuator ceiling vs ~3 Hz target | ✓ (~7–8×) |
+| Lateral accel margin above pendulum demand | 48.2 vs ~5 m/s² | ✓ (~10×) |
+| Hover headroom at max lateral thrust | 9.8:1 on uprights alone | ✓ |
+
+> Open: `MOTOR_TAU` (30 ms) and total mass to be firmed by bench/CAD; Steps 4–7 (mass budget, inertia, geometry, mixer) still to be completed from CAD.
 
 ---
 
 ## Phase 1 checkpoint: PASS / FAIL
 
-- [ ] Motor selected, thrust curve recorded
-- [ ] Cant angle chosen with vertical/lateral tradeoff modelled
-- [ ] Mass budget complete with CoM position
-- [ ] Moments of inertia estimated
-- [ ] Peak lateral acceleration calculated with margin above pendulum demand
-- [ ] Pendulum divergence timescale calculated and bandwidth target set
+- [x] Motor selected, thrust curve recorded (F60PROV-LV 1950KV, bench data in Step 2)
+- [x] Cant angle chosen with vertical/lateral tradeoff modelled (90°, justified by T/W)
+- [ ] Mass budget complete with CoM position (from CAD)
+- [ ] Moments of inertia estimated (sim values in use; firm from CAD)
+- [x] Peak lateral acceleration calculated with margin above pendulum demand (48.2 m/s², ~10×)
+- [x] Pendulum divergence timescale calculated and bandwidth target set (τ=0.226 s, ~7–8× margin)
 - [ ] Mixer matrix derived and rank-checked

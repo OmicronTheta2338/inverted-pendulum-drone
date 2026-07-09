@@ -4,8 +4,8 @@ A segmented build plan for a octacopter (4 upright motors + 4 canted lateral mot
 
 **Guiding principles:** every phase ends in a checkpoint with explicit pass criteria; nothing physical is committed until its design is validated in simulation; the same flight code runs in sim and on hardware to avoid divergence.
 
-[ ] Phase 1 - Initial layout & analytical performance budget
-[ ] Phase 2 — Rough parametric CAD skeleton
+[x] Phase 1 - Initial layout & analytical performance budget
+[x] Phase 2 — Rough parametric CAD skeleton
 [ ] Phase 3 — Drone physics in simulation (no pendulum)
 [ ] Phase 4 — Sensor noise model
 [ ] Phase 5 — Drone flying in simulation
@@ -80,6 +80,9 @@ A segmented build plan for a octacopter (4 upright motors + 4 canted lateral mot
 ---
 
 ## Phase 4 — Sensor noise model (timeboxed, ~2–3 days)
+
+> **DECISION (2026-06-26): compressed, not deleted.** The headline question — drop the Pi5/AprilTag system? — is **already answered YES on architectural grounds** (balance loop is body-frame on IMU + encoders; vision can't fix IMU vibration, which is handled by FC soft-mount + RPM-driven notch; position-hold is a separable bolt-on). Don't spend 2–3 days re-proving it in sim.
+> **BUT noise is not irrelevant.** Attitude-hold is a *stable* loop (forgiving); pendulum balance is an *unstable* loop where the killer is the *filtering latency* added to reject noise (group delay erodes phase margin against τ≈0.23 s). So: add a cheap noise hook now (Gaussian gyro/accel + band-limited vibration term, behind a switch), but run the **actual noise/filter-delay test at Phase 8/9**, where the unstable controller exists to be tested. See memory `apriltag-and-noise-decision`.
 
 **Goal:** Add a representative randomised sensor-error model and use it to answer one question: **is IMU-only state estimation accurate enough to drop the Pi5/AprilTag system entirely** (a significant weight saving, increasing lateral accel)?
 

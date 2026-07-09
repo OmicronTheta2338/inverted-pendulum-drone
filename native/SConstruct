@@ -1,0 +1,25 @@
+#!/usr/bin/env python
+# Builds the ArmBalance GDExtension against godot-cpp (4.5 branch) and drops the
+# shared library into sim-v-1/bin/, where sim-v-1/armbalance.gdextension expects it.
+#
+#   cd native && scons -j$(nproc)            # debug (default)
+#   scons target=template_release -j$(nproc) # optimized
+#
+import os
+
+env = SConscript("godot-cpp/SConstruct")
+
+env.Append(CPPPATH=["src/"])
+sources = Glob("src/*.cpp")
+
+libname = "libarmbalance"
+bindir = "../sim-v-1/bin/"
+
+if env["platform"] == "macos":
+    target = "{}{}/{}.framework/{}{}".format(
+        bindir, libname, libname, libname, env["suffix"])
+else:
+    target = "{}{}{}{}".format(bindir, libname, env["suffix"], env["SHLIBSUFFIX"])
+
+library = env.SharedLibrary(target, source=sources)
+Default(library)
