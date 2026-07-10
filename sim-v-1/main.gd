@@ -120,6 +120,8 @@ var _imu_accel_world := Vector3.ZERO   # specific force (world frame): a_total -
 # (rc_6=count, rc_7/8=arm0 angle/rate, rc_9/10=arm1 angle/rate) so the ArduPilot controller can
 # feed-forward the reaction force each arm applies on the frame. A real rig reads these from a hinge encoder.
 var n_arms := 1
+var reaction_ff_on := true       # env REACTION_FF=0 -> arms stay physically attached but the controller is
+                                 # told 0 arms, i.e. the reaction-force FF is DISABLED (Packet C: FF-on vs FF-off)
 var arm_bodies: Array[RigidBody3D] = []
 var arm_prev_theta: Array[float] = []
 var arm_has_prev: Array[bool] = []
@@ -234,6 +236,9 @@ func _ready() -> void:
 	auto_test = OS.get_environment("AUTOTEST") == "1"
 	if auto_test:
 		print("[auto] AUTOTEST mode: scripted takeoff + accel profile; keyboard ignored")
+	reaction_ff_on = OS.get_environment("REACTION_FF") != "0"   # only "0" disables; arms stay attached either way
+	if not reaction_ff_on:
+		print("[accel] reaction-force FF DISABLED (REACTION_FF=0): arms swing but are NOT compensated")
 	lockstep = OS.get_environment("LOCKSTEP") == "1"
 	if lockstep:
 		print("[bridge] LOCKSTEP mode: tight 1:1 sync (lower latency, slower-than-real-time)")
@@ -483,7 +488,10 @@ func _service_native(delta: float) -> void:
 	var yaw := 0.0
 	if Input.is_key_pressed(KEY_E): yaw += 1.0
 	if Input.is_key_pressed(KEY_Q): yaw -= 1.0
-	flightstack.set_command(lat_stick, up_stick, yaw * NATIVE_YAW_RATE, park, n_arms,
+	# reaction_ff_on=false -> tell the controller 0 arms so its reaction FF is skipped, while the physical
+	# arms (built from n_arms) keep swinging -> isolates the FF's effect in the truth-based grader.
+	flightstack.set_command(lat_stick, up_stick, yaw * NATIVE_YAW_RATE, park,
+		(n_arms if reaction_ff_on else 0),
 		Vector3(th0, th1, 0.0), Vector3(td0, td1, 0.0))
 
 	# run the ported mode-30 loop -> 8 motor PWM, then slew the plant exactly like the bridge

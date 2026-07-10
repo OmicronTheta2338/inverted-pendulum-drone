@@ -172,6 +172,18 @@ noise/latency parameters + delay-budget justification documented.
 
 ## Packet C — Arm reaction-force FF, **with arms**  *(Task 3b)*
 
+> **Status: COMPLETE (2026-07-10).** Native path, clean (truth arm state, noise off — isolate the FF
+> from sensing, which Packet B covered). Added a `REACTION_FF=0` harness toggle (`main.gd`) that tells
+> the controller 0 arms while the physical arms stay attached, isolating the FF in the truth-based
+> grader. **1 arm, FF-on tracks *identically* to 0 arms** (lat/up RMS 0.26/0.20 = baseline); FF-off
+> doubles every error and trips the analyzer (FF-on: 0 flags). 2 arms FF-on stays bounded and beats
+> FF-off, but lateral didn't fully recover to baseline **at the stale 42 ms horizon** — root-caused:
+> `PEND_PREDICT_S=0.042` is the retired *bridge* round-trip; at the native ~17 ms it halves the 2-arm
+> lateral error (0.61→0.29 RMS) and restores baseline. **Left at 0.042 pending a user decision**
+> (capstone-affecting constant). Constants checked: ratio 0.10 = 0.1/1.0 kg, L 0.60 m, and the **pivot
+> sits at the drone CoM** (`main.tscn`) so the FF's translational-only scope is geometrically justified.
+> All acceptance met. See appendix + memory `packetC-reaction-ff-validated`.
+
 **Goal:** validate the pendulum reaction FF so a *swinging* arm barely perturbs the
 drone's commanded accel — open-loop arm, **no balance controller yet**.
 
@@ -435,3 +447,69 @@ an RHP pole *in the loop* — that only exists once the balance controller close
    *not* modelled — only its extra fusion **latency** (8 ms) is. **This is the #1 thing to add if
    Packet D balance is fragile**, since the error is a transient angle *bias* correlated with the
    very maneuver that's stabilising the pole.
+
+---
+
+## Appendix — Packet C (reaction-force FF validation)
+
+Validates the arm reaction-force feed-forward (`mode_accel.cpp:199-218`): a *swinging* arm must barely
+perturb the drone's commanded acceleration. Open-loop arm, **no balance controller**. Native path,
+clean (truth arm state, `USE_SENSOR_NOISE` off — isolate the FF from sensing; Packet B covered noise).
+
+### The FF, one line
+Each arm's massless rod (a two-force member → force along the rod) applies a hinge reaction
+`T = m_b·[(g − a_d)·û + L·θ̇²]` — a weight/effective-gravity term (`(g − a_d)·û`, tilts with the drone's
+own commanded accel) plus a centripetal term (`L·θ̇²`, a pure-swing pull that exists even at zero drone
+accel). The FF Smith-predicts θ,θ̇ forward by `PEND_PREDICT_S`, projects `T` onto lat/up, and **adds the
+negative** to the thrust command (`w = a_d − g` in code). Pivot is at the CoM, so it's pure translation.
+
+### Method
+Env `REACTION_FF=0` (`main.gd`) passes `0` as the arm-count to `set_command`, so the controller's
+reaction-FF loop is skipped while the physical arms (built from `NUM_ARMS`) keep swinging. **Same plant,
+same swing, only the compensation toggles** → the FF's effect is isolated in the truth-based grader
+(`_grade`, body dv/dt, independent of the IMU signal the loop closes on). The AUTOTEST profile
+self-excites the swing (sustained lat ±6 for 6 s each → ~31° swing). 5 conditions: `NUM_ARMS={0,1,2}` ×
+`REACTION_FF={1,0}`. Run: `USE_NATIVE=1 AUTOTEST=1 NUM_ARMS=n REACTION_FF=b godot --headless --path
+sim-v-1 res://main.tscn`; grade with `sitl/autotest/analyze.py`.
+
+### Result — RMS / max tracking error (m/s², over the profile)
+| condition | lat RMS/max | up RMS/max | zero-cmd resid lat/up | analyzer flags |
+|---|---|---|---|---|
+| 0 arms (baseline) | 0.26 / 0.90 | 0.20 / 0.47 | 0.22 / 0.08 | 0 |
+| **1 arm, FF ON** | **0.26 / 0.89** | **0.20 / 0.69** | 0.20 / 0.17 | **0** |
+| 1 arm, FF OFF | 0.50 / 1.79 | 0.46 / 1.24 | 0.43 / 0.48 | 2 |
+| **2 arm, FF ON** | 0.61 / 2.25 | 0.25 / 1.06 | 0.30 / 0.20 | **0** |
+| 2 arm, FF OFF | 0.76 / 3.42 | 0.64 / 1.60 | 0.65 / 0.86 | 2 |
+
+- **1 arm: the FF makes the arm invisible** — FF-on RMS equals the 0-arm baseline exactly (0.26/0.20).
+- **FF-on ≫ FF-off on every axis, both arm counts.** FF-off ~doubles lat & up error, ~2× the
+  zero-command residual (how hard a free swing shoves the *uncommanded* drone), and trips 2 analyzer
+  error-flags vs 0 for FF-on. Vertical benefit is extra-large because the FF also carries the arm's
+  static weight `m_b·g` that the bare-calibrated hover throttle misses.
+- Acceptance (degrades minimally vs 0 arms; FF-on ≫ FF-off): **PASS.**
+
+### Finding — the prediction horizon is stale (bridge-era)
+2-arm FF-on lateral (0.61) didn't fully return to baseline and *overshot* (settled +6 → 6.20) —
+over-correction, not gain droop. `PEND_PREDICT_S = 0.042 s` is the retired UDP bridge's ~40 ms
+round-trip; the native loop is ~17 ms (Packet A actuator ~15 ms + compute/ZOH ~2.5 ms; truth arm state
+adds no sense delay here). Re-running FF-on at **0.017 s**:
+
+| case | 42 ms | **17 ms** | baseline |
+|---|---|---|---|
+| 2 arm lat RMS/max | 0.61 / 2.25 | **0.29 / 0.82** | 0.26 / 0.90 |
+| 1 arm lat RMS | 0.26 | 0.27 | 0.26 |
+
+At the native horizon the 2-arm lateral **halves and returns to baseline**; 1 arm is unchanged (its
+reaction is small enough that over-prediction barely bit). **Reverted to 0.042** — adopting a new value
+is a capstone-affecting design decision. *Recommendation:* set `PEND_PREDICT_S` to the native regime
+for Packet D. It's regime-dependent — **~17 ms matches the clean loop, ~25 ms matches the noisy
+capstone** (Packet B adds ~8 ms arm-angle IMU-fusion latency) — so pick it with the Packet-D noise
+model in the loop. Either beats 42 ms.
+
+### Constants sanity check
+| constant | value | check |
+|---|---|---|
+| `PEND_MASS_RATIO` | 0.10 | = bob 0.1 kg / drone 1.0 kg (`main.tscn`) ✓ |
+| `PEND_L` | 0.60 m | = Bob offset `(0,−0.6,0)`; rod is a mesh with no collision → massless, so the point-mass model is exact ✓ |
+| `PEND_PREDICT_S` | 0.042 s | **stale** (bridge); native ~17–25 ms — see finding |
+| pivot vs CoM | ≈0 offset | Drone CoM at origin (`center_of_mass_mode=1`, mass 1.0); `Pivot` hinge at world origin → **at the CoM**, so the reaction is pure translation (no attitude torque) and the FF's lat/up-only scope is justified ✓ |
