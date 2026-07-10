@@ -23,7 +23,7 @@ This is **not** a from-scratch build. State of the four original goals:
 |---|---|---|
 | Portable C++ control layer | **Done** — `ApFlightStack` wired in | Git-track it; hand-sync with firmware |
 | Fast/precise accel mode | **Implemented** — overdrive FF, delayed-fb I, drag-cancel, 0/1/2-arm reaction FF in `mode_accel.cpp` | Validated vs the *bridge*, not the native path → re-validate (Packets A, C) |
-| Sensor-noise layer | **Scaffolded, off** — `main.gd:_sensed_state()` (`:146-177`, `USE_SENSOR_NOISE=1`) | Enable, tune, validate the **latency budget** (Packet B) |
+| Sensor-noise layer | **Validated (Packet B)** — `main.gd:_sensed_state()`, `USE_SENSOR_NOISE=1`; accel loop tracks under noise, delay budget ~25 ms ≪ 139 ms | Empirical RHP break-test deferred to D (needs the pole in the loop) |
 | Balancing scripts | **Pass Phase 8 — but vs an *idealized* accel model** (first-order cart, τ≈8 ms, `balance_test.gd`). Never stacked on real `ModeAccel` | Close the full loop (Packet D, capstone) |
 
 **Intended outcome:** a fully native (bridge-free) sim where the real `ModeAccel`
@@ -70,7 +70,7 @@ in the harness; do **not** replicate `AP_InertialSensor_SITL`.
 ## Sequencing / dependencies
 
 ```
-Packet 0 (baseline + git)  ─┬─►  Packet A (accel, no arms) ─┐
+Packet 0 ✅ (baseline+git) ─┬─►  Packet A ✅ (accel, no arms) ─┐
                             └─►  Packet B (noise+latency) ──┼─► Packet D (integration) ─► Packet E (retune, contingent)
                                  Packet A ──► Packet C (arms) ─┘
 ```
@@ -99,7 +99,14 @@ hovers; baseline committed.
 
 ---
 
-## Packet A — Native accel loop, **no arms**  *(Task 3a + finish Task 1)*
+## Packet A — Native accel loop, **no arms**  ✅ **COMPLETE** *(Task 3a + finish Task 1)*
+
+> **Status: COMPLETE (2026-07-10).** Native path, 0 arms: lat +6 enters the 5% band at
+> ~15 ms, 0.7% overshoot, settles <1%; +12 saturates the overdrive → 3.7% overshoot
+> (bang-bang regime). Drag-cancel holds accel to 36 m/s; park hold pins lateral velocity
+> at −2.89 m/s flat for 30 s — no runaway. Constants byte-identical to the ArduPilot
+> source (only I/O binding diverges). SPEC reconstructed → appendix below. All acceptance
+> criteria met. *(memory: `packetA-native-accel-validated`)*
 
 **Goal:** prove native `ModeAccel` realizes commanded **vertical & lateral** accel fast
 and precisely on the native path (clean truth first): ~40 ms to 5%, drag-cancel →
@@ -127,7 +134,18 @@ constant-velocity at zero command; no runaway; spec written.
 
 ---
 
-## Packet B — Sensor-noise + latency layer (harness)  *(Task 2)*
+## Packet B — Sensor-noise + latency layer (harness)  ✅ **COMPLETE** *(Task 2)*
+
+> **Result (native path):** noise layer enabled, tuned to the real sensor plan, validated.
+> The 0-arm accel loop tracks *identically* with noise on vs off (mean|e| lat 0.085 vs 0.083,
+> up 0.272 vs 0.268) — the grader stays on TRUTH (`main.gd:456`) and the FF-dominant loop
+> attenuates the injected accel σ (0.35 m/s²) ~60× to a ~0.006 m/s² realised residual. **No
+> drift** over the 50 s hold (flat ~0.006, not growing) because this loop closes no position
+> feedback. Arm sensing was **split by hardware** — arm 1 = 2×IMU fusion, arm 2 = magnetic
+> encoder (see appendix). 2-arm smoke stayed bounded (no runaway; full arm validation is C).
+> **Delay budget:** effective θ-loop delay ≈ 25 ms ≪ 247 ms (single) / 139 ms (double) → ~10× /
+> ~5.6× margin; the ~15 ms native actuator lag dominates, sensor latencies are noise in it.
+> Full model + budget → appendix "Sensor + latency layer".
 
 **Goal:** enable, tune, validate the existing `_sensed_state` model on the native path.
 The point is the **latency budget** (concept #2), not amplitude cosmetics.
@@ -239,9 +257,181 @@ delay margin. May fold into D.
 
 ---
 
-## Appendix — SPEC reconstruction (filled in by Packet A)
+## Appendix — SPEC (reconstructed by Packet A)
 
-> `mode_accel.cpp` references a spec that has no file. Packet A reconstructs it here:
-> response target (~40 ms to 5%), the inverse-motor overdrive FF rationale, the
-> drag-cancel constant-velocity property, and the calibrated constants with their
-> 1.0 kg provenance. *(To be written.)*
+`mode_accel.cpp` cites "SPEC 3 / 4.2 / 6 / §7" but no file existed. This is that spec,
+reconstructed from the code + the Packet-A validation run. Everything here targets the
+sim's **MASS = 1.0 kg** body (850 g recal deferred — see *Decisions locked*).
+
+### §3 Response target
+Commanded lateral/vertical acceleration is realised **fast, monotone, and without
+overshoot**: to within 5% of a step in **~40 ms** (design ceiling), with settled error
+<1%. *Measured (native, 0 arms):* lat +6 m/s² enters the 5% band at **~15 ms**, peaks
+6.04 (**0.7% overshoot**), settles <1%. This is the loop the balance layer will close on,
+so **overshoot in realised accel = a disturbance kick to the pendulum** — a clean monotone
+rise is worth more than raw speed.
+
+### §4.1 Feed-forward = plant inversion onto a *chosen* reference (the load-bearing idea)
+The lateral/vertical actuator is a first-order lag: `ȧ = (u − a)/τ` (accel `a` chases
+command `u` at rate ∝ the gap; sim `MOTOR_TAU ≈ 30 ms`). For a first-order plant, **any**
+smooth output path `a_des(t)` is produced by exactly one command,
+
+```
+    u(t) = a_des(t) + τ · ȧ_des(t)          (the "+1" delivers the target; the "τ·s" is the overdrive)
+```
+
+so the command is *not unique* — the design **chooses** the output path and inverts onto
+it. We choose a **first-order reference** `a_des = A·(1 − e^(−t/FF_TAU))`, `FF_TAU = 8 ms`.
+That single choice generates everything:
+- **Overdrive.** At the step the command leads the target by `τ/FF_TAU ≈ 4.6×`
+  (`lat_ff = ref + tau_lat·(cmd − ref)/FF_TAU`, `mode_accel.cpp:88-90`). e.g. a **+6**
+  command feeds **~27.75 m/s²** on the first tick, then decays to 6 with an 8 ms constant.
+  This is why the response beats the motor's own ~3τ ≈ 84 ms: the `(τs+1)` premultiply
+  *cancels* the motor lag, leaving the 8 ms reference we designed.
+- **Why the first-order member (not a faster one).** The fast end of the family is
+  minimum-time bang-bang — also pure feed-forward, also no "look and see", but its switch
+  time is only right if `τ` is exactly right. The first-order FF is the **robust** member:
+  forgiving of `τ` error (battery sag, motor temp, prop wear on the H743), monotone under
+  model mismatch. **FF does ~95%; a small delayed I trims the last ~5%.** In the sim `τ`
+  matches exactly, so the conservatism buys nothing *here* except noise/latency margin for
+  Packet B — its real payoff is hardware transfer.
+- **Saturation-aware reference governor** (`mode_accel.cpp:91-114`). When the demanded
+  overdrive exceeds the rail (`ACCEL_LAT_MAX_MSS = 38`), clamp the command to the rail and
+  advance the reference as a plant driven by the rail; an overshoot-guard snaps `ref → cmd`
+  on crossing. This *is* an (involuntary) bang-bang segment: a **+12** command wants
+  `0.040·12/0.008 = 60 > 38`, so it saturates → **3.7% overshoot** vs +6's 0.7%. The extra
+  overshoot at +12 is the measured price of losing the exact inverse to the rail.
+
+### §4.2 Drag-cancel → constant velocity at zero command
+At zero accel command the body must **coast at constant lateral velocity**, not decay.
+`a_lat_out += ACCEL_DRAG_K_LAT · v_lat` (`:150`) cancels velocity-dependent aero drag.
+`K = 0.05 ≤ true drag coeff` **deliberately** (under-cancel, never over-cancel — over-cancel
+is positive feedback → runaway; see memory `accel-drag-ff-runaway`). **Lateral only** — no
+`+K·v` on the vertical/throttle axis (would fight the throttle floor / rocket). *Measured:*
+sustained +6 for 6 s ramps velocity **linearly to 35.76 m/s** (avg accel 5.96 — drag fully
+cancelled up to 36 m/s); park hold pins lat velocity at **−2.89 m/s flat for 30 s**, fwd
+drift ±0.03 m, yaw ±0.02° → **no runaway on any axis**.
+
+### §6 Feedback: delayed-reference I, P disabled
+`KP_LAT = KP_UP = 0` — with the overdrive FF driving the plant, a plain P on `a_meas`
+fights the FF and rings. Instead a **gentle I** (`KI = 2 /s`) trims the small steady
+residual (FF alone lands ~5–6% low; I pulls it to <1% over ~0.5 s). The error is formed
+against a **15 ms-delayed** copy of the FF reference (`ACCEL_FB_DELAY`, ring buffer
+`:116-125`) because `a_meas` lags the command by about that — comparing to the *undelayed*
+reference would read a false error during every rise. Anti-windup freezes I at the rails.
+
+### §7 Independent grader
+Truth = the rigid body's own `dv/dt`, computed in `main.gd:_grade()` and **never** put in
+the state packet, so it's independent of the IMU/EKF signal the controller closes on. In
+sim both ultimately derive from Godot truth, so this validates the FF/trim math (incl.
+zero-command drift), **not** hardware bias rejection (that needs the Packet-B noise model).
+
+### Calibrated constants (1.0 kg provenance)
+All calibrated for the sim's 1.0 kg body (the 7-03 MASS-1.0 recal; memory
+`accel-overdrive-40ms`). Values below are authoritative from `mode_accel.cpp`:
+
+| constant | value | meaning / how to re-derive |
+|---|---|---|
+| `ACCEL_LAT_MAX_MSS` | 38.0 | realised m/s² at `set_lateral(1.0)`; measure peak lat accel at full canted stick, 1.0 kg |
+| `ACCEL_LAT_MAX_MSS_NEG_A/B` | 40.6 / 0.25 | empirical negative-rail LUT (canted mixer's −gain is nonlinear) |
+| `ACCEL_LAT_CMD_MSS` | 12.0 | accel at full lateral stick (also the balance→stick 1:1 map, Packet D) |
+| `ACCEL_HOVER_THR` | 0.096 | throttle for zero net vertical accel; = MASS·g / full-thrust |
+| `ACCEL_VERT_THR_PER_MSS` (up/down) | 0.0132 / 0.0124 | Δthrottle per m/s² about hover, asymmetric (concave thrust curve) |
+| `ACCEL_MOTOR_TAU_LAT / _UP / _LAT_K` | 0.028 / 0.037 / 0.0015 | effective plant lag the FF inverts (≈ sim `MOTOR_TAU` + mixer); lat τ grows with |cmd| |
+| `ACCEL_FF_TAU` | 0.008 | chosen reference-rise constant → sets overdrive `τ/FF_TAU` and noise gain |
+| `ACCEL_FB_DELAY` | 0.015 | reference delay ≈ measured lag of `a_meas` behind the command |
+| `ACCEL_DRAG_K_LAT` | 0.05 | lateral drag-cancel gain, ≤ true drag coeff (never over-cancel) |
+| `ACCEL_KI_LAT / _UP` | 2.0 / 2.0 | steady-residual trim; `KP = 0` |
+
+**Sync:** all constants are byte-identical to
+`~/03_Projects/ardupilot/ArduCopter/mode_accel.cpp`. Only intended divergence = I/O
+binding: native reads typed `AccelInput`/`AhrsState`; firmware reads `rc().channel()` +
+`AP::ahrs()` and carries two RC-encoding constants (`PEND_RATE_MAX`, `PEND_ANG_CH`) the
+typed path doesn't need.
+
+---
+
+## Appendix — Sensor + latency layer (reconstructed by Packet B)
+
+Harness-only (`main.gd:_sensed_state`, `:_sensor_setup`); **never ships to the H743** — it *is*
+"the hardware." It degrades the state `ModeAccel` reads with per-channel Gaussian noise +
+measurement/EKF latency (ring buffers), so the controller is validated on representative sensing.
+The grader (`_grade`, `:456` / `:746`) stays on **truth** — realised-vs-commanded accel is scored
+from the Jolt body's own dv/dt, independent of what the controller saw.
+
+### The one load-bearing idea: latency, not amplitude, is the killer
+The pendulum has a right-half-plane pole at √(g/L); its error e-folds on a timescale `1/p`. A
+feedback loop can only stabilise it if the **total effective loop delay ≪ 1/p** — a *fraction*,
+not merely `<`, because a delay equal to `1/p` lets the error grow by `e` before the correction
+lands, and there is uncounted phase lag (controller dynamics, finite accel-loop bandwidth) on top.
+Noise **amplitude** does not enter this — it only sets control chatter. That is why this packet is
+about the latency budget, and why σ-tuning is cosmetics.
+
+**Subtlety (why σ is cosmetic *in this harness*):** on real hardware σ and latency *are* coupled
+— a noisier sensor forces you to low-pass harder, and the filter's group delay eats the margin
+(worst on the arm-**rate** channel, which sits on the RHP loop). This harness deliberately models
+σ and latency as **orthogonal** knobs (no filter converts one into the other). So here, sweeping σ
+moves the margin by 0; only `SENSOR_LAT_*` touches it. The real σ↔latency coupling is a
+hardware-transfer concern, recorded below, not simulated.
+
+### Per-channel model
+1σ Gaussian per channel (SI), read back through a per-group latency ring (depth = ms/2.5 at 400 Hz).
+
+| channel | σ (1σ) | latency | source / rationale |
+|---|---|---|---|
+| gyro (body) | 0.05 °/s + bias walk 0.5 °/s/√hr | 2.5 ms | MEMS gyro, raw INS at loop rate |
+| accel_ef | 0.35 m/s² | 2.5 ms | ~5 mg sensor + **~30 mg vibration RMS** folded into one σ (the real unknown) |
+| attitude (quat) | 0.1° | 8 ms | EKF3 attitude output-observer lag |
+| velocity NED | 0.03 m/s | 20 ms | EKF velocity (IMU dead-reckon) |
+| position NED | 0.02 m + random-walk 0.05 m/√s | 20 ms | **IMU-only** dead reckoning — no GPS/vision (short flights) |
+| arm-1 angle θ₀ | 0.15° | **8 ms** | 2×IMU fused attitude: drift-bounded, maneuver-coupled |
+| arm-1 rate θ̇₀ | 0.4 °/s | 2.5 ms | differential gyro — clean; **the RHP-critical channel** |
+| arm-2 angle θ₁ | 0.10° + LSB 0.05° | 2.5 ms | magnetic encoder (~13-bit), clean |
+| arm-2 rate θ̇₁ | 1.0 °/s | 2.5 ms | differentiated encoder, noisier |
+
+**Env knobs:** `USE_SENSOR_NOISE`, `SENSOR_SEED`, `SENSOR_POS_DRIFT`,
+`SENSOR_LAT_EKF_{ATT,VEL,POS}_MS`, `SENSOR_LAT_ARM_IMU_MS`.
+
+**Arm-sensing rationale (hardware):** the central tube is hollow (structural), so no magnetic
+encoder fits the arm-1 root → sense arm-1 *angle* by two IMUs relative to the body IMU. A gyro
+integrates to unbounded angle drift, so the accel **gravity vector** must anchor it — and that
+anchor lies under acceleration (specific force = gravity + linear accel), worst during the catch.
+Two accels (common-mode/differential) recover a maneuver-robust reference at the cost of fusion
+latency (→ the 8 ms on θ₀). The IMU is *strong* on rate (clean differential gyro, 2.5 ms) and that
+rate is exactly the RHP-critical term. Arm 2 uses a magnetic encoder (clean, quantized).
+
+### Delay budget vs the RHP pole
+- Single pendulum: `p = √(g/L) = √(9.81/0.6) = 4.04 rad/s → 1/p = 247 ms`.
+- Double pendulum: fastest unstable pole `≈ 7.2 rad/s → 1/p = 139 ms`.
+- Effective θ-loop delay (series around the stabilising loop):
+
+  | term | delay |
+  |---|---|
+  | arm-1 angle sense (IMU fusion) | 8 ms |
+  | accel realisation (**native**, Packet A) | ~15 ms |
+  | compute + one-tick ZOH | ~2.5 ms |
+  | **effective** | **~25 ms** |
+
+  → **margin ≈ 10× (single) / 5.6× (double)** — comfortably `≪ 1/p`.
+
+**The actuator dominates.** The ~15 ms accel-realisation lag is ~60% of the budget; every sensor
+latency (2.5–20 ms) is secondary, and the 20 ms EKF vel/pos sits on the slower cart-*centering*
+loop, not the RHP-critical θ path. So if the double-arm margin ever proves tight, the lever is the
+**accel loop / reaction FF**, not the sensors. *(Note: concept #3's "~40 ms" is the retired
+**bridge** figure — RC-pipeline latency was a harness artifact; native Packet A measured ~15 ms and
+supersedes it here.)* The *empirical* margin break-test (adding latency until balance fails) needs
+an RHP pole *in the loop* — that only exists once the balance controller closes it, so it lives in
+**Packet D**, not here.
+
+### Assumptions to revisit at hardware bring-up
+1. **Arm-sensing hardware is undecided.** σ / LSB / latency above are defensible mid-grade guesses
+   (2×IMU arm 1, magnetic encoder arm 2). Re-derive once parts are chosen.
+2. **Velocity drift** is folded into the position random-walk (no explicit velocity-drift channel).
+   If Packet D is velocity-sensitive, add one — or add **optical flow** (a velocity sensor, hitting
+   the IMU's weakest channel) rather than a position sensor.
+3. **Arm-2 absolute angle inherits arm-1 drift** (the encoder is a *relative* joint measurement).
+   Omitted — `truth["theta1"]` is fed absolute. Add if the double-arm estimate looks fragile.
+4. **Maneuver-coupled arm-1 angle error** (the accel gravity anchor tilting under catch accel) is
+   *not* modelled — only its extra fusion **latency** (8 ms) is. **This is the #1 thing to add if
+   Packet D balance is fragile**, since the error is a transient angle *bias* correlated with the
+   very maneuver that's stabilising the pole.

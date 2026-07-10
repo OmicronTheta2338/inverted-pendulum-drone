@@ -152,16 +152,25 @@ const NATIVE_YAW_RATE := 0.7854       # rad/s (~45 deg/s) commanded per full Q/E
 @export var sig_att_deg := 0.1             # EKF attitude noise [deg]
 @export var sig_vel := 0.03                # velocity NED noise [m/s]        (IMU dead-reckoning)
 @export var sig_pos := 0.02                # position NED noise [m]
-@export var sig_theta_deg := 0.2           # arm angle noise [deg]           (encoder, Balance 5)
-@export var enc_lsb_deg := 0.05            # arm-encoder quantization step [deg]
-@export var sig_thetadot_dps := 1.0        # arm rate noise [deg/s]          (arm gyro, Balance 5)
+# Arm sensing is ASYMMETRIC by hardware (see plan appendix "Packet B - sensor layer"): arm 1
+# (proximal, on the hollow central tube -> no room for a magnetic encoder) senses ANGLE via two
+# IMUs relative to the body IMU. That fusion gives a clean differential-gyro RATE but a
+# drift-bounded, maneuver-coupled, ~EKF-latency ANGLE (gyro integrates -> unbounded drift, so the
+# accel gravity vector must anchor it; that anchor lies under acceleration). Arm 2 (distal) uses a
+# magnetic encoder: clean, low-latency, LSB-quantized angle, but a noisier differentiated rate.
+@export var sig_theta0_deg := 0.15         # arm-1 angle [deg]  (2xIMU fused attitude; NO LSB)
+@export var sig_theta1_deg := 0.10         # arm-2 angle [deg]  (magnetic encoder)
+@export var enc_lsb_deg := 0.05            # arm-2 encoder quantization step [deg] (~13-bit)
+@export var sig_thetadot0_dps := 0.4       # arm-1 rate [deg/s] (differential gyro, clean)
+@export var sig_thetadot1_dps := 1.0       # arm-2 rate [deg/s] (differentiated encoder, noisier)
 @export var pos_drift_rate := 0.05         # dead-reckon position random-walk [m/sqrt(s)]
 # per-group measurement latency / EKF lag [ms] -> ring-buffer depth (rounded to ticks)
 @export var lat_imu_ms := 2.5              # accel_ef, gyro (raw INS, ~loop rate)
 @export var lat_ekf_att_ms := 8.0          # EKF attitude output-observer lag
 @export var lat_ekf_vel_ms := 20.0         # EKF velocity lag
 @export var lat_ekf_pos_ms := 20.0         # EKF position lag
-@export var lat_arm_ms := 2.5              # encoder + arm gyro read
+@export var lat_arm_ms := 2.5              # arm-2 encoder + differential-gyro read (clean channels)
+@export var lat_arm_ang_imu_ms := 8.0      # arm-1 IMU-FUSED angle only (attitude-observer lag ~EKF att)
 
 var sensor_rng := RandomNumberGenerator.new()
 var _hist: Array = []                      # ring of per-tick sensed (noisy) state snapshots
@@ -173,6 +182,7 @@ var _d_att := 3
 var _d_vel := 8
 var _d_pos := 8
 var _d_arm := 1
+var _d_arm_imu := 3                        # arm-1 IMU-fused ANGLE latency (deeper than clean arm chans)
 var _gyro_bias := Vector3.ZERO             # slow gyro bias (random walk)
 var _pos_drift := Vector3.ZERO             # accumulated dead-reckon position drift (NED)
 
@@ -492,6 +502,7 @@ func _sensor_setup() -> void:
 	v = OS.get_environment("SENSOR_LAT_EKF_ATT_MS");    if v != "": lat_ekf_att_ms = float(v)
 	v = OS.get_environment("SENSOR_LAT_EKF_VEL_MS");    if v != "": lat_ekf_vel_ms = float(v)
 	v = OS.get_environment("SENSOR_LAT_EKF_POS_MS");    if v != "": lat_ekf_pos_ms = float(v)
+	v = OS.get_environment("SENSOR_LAT_ARM_IMU_MS");    if v != "": lat_arm_ang_imu_ms = float(v)
 	sensor_rng.seed = sensor_seed
 
 	# ring-buffer sized to the largest latency; per-group depths in ticks
@@ -501,13 +512,14 @@ func _sensor_setup() -> void:
 	_d_vel = int(round(lat_ekf_vel_ms / 1000.0 * ticks))
 	_d_pos = int(round(lat_ekf_pos_ms / 1000.0 * ticks))
 	_d_arm = int(round(lat_arm_ms     / 1000.0 * ticks))
-	_sb_len = maxi(maxi(maxi(_d_imu, _d_att), maxi(_d_vel, _d_pos)), _d_arm) + 1
+	_d_arm_imu = int(round(lat_arm_ang_imu_ms / 1000.0 * ticks))
+	_sb_len = maxi(maxi(maxi(_d_imu, _d_att), maxi(_d_vel, _d_pos)), maxi(_d_arm, _d_arm_imu)) + 1
 	_hist.resize(_sb_len)
 	_sb_idx = 0
 	_sensor_seeded = false
 	if sensor_noise_enabled:
-		print("[sensor] model ON seed=%d lat(imu/att/vel/pos/arm ticks)=%d/%d/%d/%d/%d drift=%d" % [
-			sensor_seed, _d_imu, _d_att, _d_vel, _d_pos, _d_arm, int(sensor_pos_drift)])
+		print("[sensor] model ON seed=%d lat(imu/att/vel/pos/arm/arm_imu ticks)=%d/%d/%d/%d/%d/%d drift=%d" % [
+			sensor_seed, _d_imu, _d_att, _d_vel, _d_pos, _d_arm, _d_arm_imu, int(sensor_pos_drift)])
 
 
 # Add fresh per-channel Gaussian noise (+ gyro bias walk / encoder quantization / dead-reckon
@@ -538,14 +550,19 @@ func _sensed_state(truth: Dictionary, dt: float) -> Dictionary:
 		_pos_drift += Vector3(g.randfn(), 0.0, g.randfn()) * pos_drift_rate * sqrt(dt)
 	var pos_n: Vector3 = truth["pos_ned"] + _pos_drift + Vector3(g.randfn(), g.randfn(), g.randfn()) * sig_pos
 
-	# arm angle (encoder: quantize to LSB, then noise) + rate (arm gyro: noise)
+	# arm 1 (proximal): 2xIMU fused -> continuous angle (NO encoder LSB) + clean differential-gyro
+	# rate. NOTE (documented simplification): the maneuver-coupled angle error -- the accel gravity
+	# anchor tilting under the drone's catch acceleration -- is NOT modelled here; only its extra
+	# fusion LATENCY is (read back at _d_arm_imu below). Revisit at hardware / if Packet D is fragile.
+	var th0: float = float(truth["theta0"]) + g.randfn() * (sig_theta0_deg * d2r)
+	var td0: float = float(truth["tdot0"]) + g.randfn() * (sig_thetadot0_dps * d2r)
+	# arm 2 (distal): magnetic encoder -> quantize angle to LSB then add noise; differentiated rate.
+	# NOTE (documented simplification): arm-2's ABSOLUTE angle inherits arm-1's drift (encoder is a
+	# RELATIVE joint measurement); truth["theta1"] is fed absolute here, so that coupling is omitted.
 	var lsb := deg_to_rad(enc_lsb_deg)
-	var st := sig_theta_deg * d2r
-	var std := sig_thetadot_dps * d2r
-	var th0: float = (round(float(truth["theta0"]) / lsb) * lsb if lsb > 0.0 else float(truth["theta0"])) + g.randfn() * st
-	var th1: float = (round(float(truth["theta1"]) / lsb) * lsb if lsb > 0.0 else float(truth["theta1"])) + g.randfn() * st
-	var td0: float = float(truth["tdot0"]) + g.randfn() * std
-	var td1: float = float(truth["tdot1"]) + g.randfn() * std
+	var th1_q: float = (round(float(truth["theta1"]) / lsb) * lsb if lsb > 0.0 else float(truth["theta1"]))
+	var th1: float = th1_q + g.randfn() * (sig_theta1_deg * d2r)
+	var td1: float = float(truth["tdot1"]) + g.randfn() * (sig_thetadot1_dps * d2r)
 
 	var snap := {
 		"accel_ef": accel_n, "gyro": gyro_n, "quat": quat_n,
@@ -565,10 +582,10 @@ func _sensed_state(truth: Dictionary, dt: float) -> Dictionary:
 		"quat":     _read_ch("quat", _d_att),
 		"vel_ned":  _read_ch("vel_ned", _d_vel),
 		"pos_ned":  _read_ch("pos_ned", _d_pos),
-		"theta0":   _read_ch("theta0", _d_arm),
-		"theta1":   _read_ch("theta1", _d_arm),
-		"tdot0":    _read_ch("tdot0", _d_arm),
-		"tdot1":    _read_ch("tdot1", _d_arm),
+		"theta0":   _read_ch("theta0", _d_arm_imu),   # arm-1 fused angle: deeper (EKF-att-like) latency
+		"theta1":   _read_ch("theta1", _d_arm),        # arm-2 encoder: clean, ~loop-rate
+		"tdot0":    _read_ch("tdot0", _d_arm),         # arm-1 differential gyro: clean rate
+		"tdot1":    _read_ch("tdot1", _d_arm),         # arm-2 differentiated encoder
 	}
 	_sb_idx = (_sb_idx + 1) % _sb_len
 	return out
