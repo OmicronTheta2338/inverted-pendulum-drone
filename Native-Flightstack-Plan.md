@@ -172,17 +172,17 @@ noise/latency parameters + delay-budget justification documented.
 
 ## Packet C — Arm reaction-force FF, **with arms**  *(Task 3b)*
 
-> **Status: COMPLETE (2026-07-10).** Native path, clean (truth arm state, noise off — isolate the FF
-> from sensing, which Packet B covered). Added a `REACTION_FF=0` harness toggle (`main.gd`) that tells
-> the controller 0 arms while the physical arms stay attached, isolating the FF in the truth-based
-> grader. **1 arm, FF-on tracks *identically* to 0 arms** (lat/up RMS 0.26/0.20 = baseline); FF-off
-> doubles every error and trips the analyzer (FF-on: 0 flags). 2 arms FF-on stays bounded and beats
-> FF-off, but lateral didn't fully recover to baseline **at the stale 42 ms horizon** — root-caused:
-> `PEND_PREDICT_S=0.042` is the retired *bridge* round-trip; at the native ~17 ms it halves the 2-arm
-> lateral error (0.61→0.29 RMS) and restores baseline. **Left at 0.042 pending a user decision**
-> (capstone-affecting constant). Constants checked: ratio 0.10 = 0.1/1.0 kg, L 0.60 m, and the **pivot
-> sits at the drone CoM** (`main.tscn`) so the FF's translational-only scope is geometrically justified.
-> All acceptance met. See appendix + memory `packetC-reaction-ff-validated`.
+> **Status: COMPLETE (2026-07-11) — series double inverted pendulum.** The first pass validated the FF
+> against `main.tscn`'s two *parallel* arms; that was the wrong topology (`scene-topology-native-vs-balance`).
+> `main.tscn` is now the real **series chain** (`Arm2` hinges to `Arm`'s tip), and the reaction FF was
+> generalised from a per-arm sum to the **coupled** double-pendulum reaction `R = Σ mᵢ(g − a_bobᵢ)`, with
+> each link's `θ̈` from the coupled EOM under effective gravity `g_eff = g − a_d`. It reduces *exactly* to
+> the single-pendulum form at `m₂=0`. **Derivation validated against truth:** the harness computes the true
+> reaction from the bobs' own accelerations (`REACT_VALIDATE=1`); the formula matches it to **4.7 % lat /
+> 3.1 % up**. **FF cuts the double-pendulum disturbance ~2.2×** (lat 1.18→0.53, up 1.00→0.44 RMS); the
+> single link returns to the 0-arm baseline. Smith prediction left OFF (`PEND_PREDICT_S=0`): >0 helps
+> lateral but destabilises the vertical near aligned links — a Packet-D tuning knob. **Packets A and B are
+> unaffected** (A is 0-arm; B is a topology-independent sensor layer). See appendix + memory.
 
 **Goal:** validate the pendulum reaction FF so a *swinging* arm barely perturbs the
 drone's commanded accel — open-loop arm, **no balance controller yet**.
@@ -450,7 +450,11 @@ an RHP pole *in the loop* — that only exists once the balance controller close
 
 ---
 
-## Appendix — Packet C (reaction-force FF validation)
+## Appendix — Packet C (reaction-force FF validation — PARALLEL arms, SUPERSEDED)
+
+> **Superseded** by "Appendix — Packet C (series double inverted pendulum)" below. This section
+> validated the FF against two *parallel* arms in an early `main.tscn`; the project's real target is a
+> *series* chain, so the reaction FF was generalised and re-validated. Kept for the record.
 
 Validates the arm reaction-force feed-forward (`mode_accel.cpp:199-218`): a *swinging* arm must barely
 perturb the drone's commanded acceleration. Open-loop arm, **no balance controller**. Native path,
@@ -513,3 +517,70 @@ model in the loop. Either beats 42 ms.
 | `PEND_L` | 0.60 m | = Bob offset `(0,−0.6,0)`; rod is a mesh with no collision → massless, so the point-mass model is exact ✓ |
 | `PEND_PREDICT_S` | 0.042 s | **stale** (bridge); native ~17–25 ms — see finding |
 | pivot vs CoM | ≈0 offset | Drone CoM at origin (`center_of_mass_mode=1`, mass 1.0); `Pivot` hinge at world origin → **at the CoM**, so the reaction is pure translation (no attitude torque) and the FF's lat/up-only scope is justified ✓ |
+
+---
+
+## Appendix — Packet C (series double inverted pendulum)
+
+Supersedes the parallel-arm appendix above. Validates the reaction FF for the project's real target: a
+**series double inverted pendulum** — link2 hinged to link1's tip, the cart (drone) acceleration the only
+input. Open-loop chain, no balance controller. Native path, clean truth (noise off).
+
+### Scene
+`main.tscn` converted to the series chain: `Pivot2` now hinges `Arm2` to **`Arm`'s tip** (was: both arms
+to the drone). Hanging chain, L1 = L2 = 0.60 m, bobs 0.1 kg each, drone 1.0 kg. *(Capstone: adopt the
+balance LQR's L1=0.7 / L2=0.6 — a one-line `PEND_L1/L2` change.)*
+
+### The reaction (the load-bearing derivation)
+The chain loads the drone through **link-1's root hinge only**. Isolate the chain (both bobs), apply
+Newton's 3rd law → the reaction on the cart is the chain's total (weight − inertial reaction):
+
+```
+    R = Σ_i m_i (g_vec − a_bob_i)
+```
+
+`a_bob2` rides on link-1's motion (the coupling the parallel sum missed). The two links' angular
+accelerations come from the **coupled double-pendulum EOM** under effective gravity `g_eff = g_vec − a_d`
+(û⊥ = the per-link tangent, Δ = θ1−θ2):
+
+```
+    (m1+m2)L1 θ̈1 + m2 L2 cosΔ θ̈2 = (m1+m2)(g_eff·û1⊥) − m2 L2 sinΔ θ̇2²
+    L1 cosΔ θ̈1 +        L2 θ̈2 =        (g_eff·û2⊥)     + L1 sinΔ θ̇1²
+```
+
+The FF adds `−R/m_d` to the thrust command. At `m₂=0` this collapses **exactly** to the old
+single-pendulum along-rod form (verified in algebra and in-sim). Code: `mode_accel.cpp` reaction block.
+
+### Validated against truth (the "accurate" check)
+`REACT_VALIDATE=1` (`main.gd:_react_validate`) computes the **true** reaction from each bob's own
+finite-differenced acceleration (each arm's CoM = its bob) and compares it to the formula re-derived from
+(θ, θ̇, a_d) — identical math to the C++. Over a full flight the formula matches truth to **4.7 % lateral
+/ 3.1 % vertical** (true reactions ~1.5 / ~2.4 m/s²); the residual is finite-difference/discretisation,
+not structure. **The coupled derivation is correct.**
+
+### Result — RMS / max tracking error (m/s², over the profile)
+| condition | lat RMS/max | up RMS/max |
+|---|---|---|
+| 0 arms (baseline) | 0.26 / 0.90 | 0.20 / 0.47 |
+| 1 link, FF ON | 0.29 / 0.83 | 0.22 / 0.69 |
+| 1 link, FF OFF | 0.50 / 1.79 | 0.46 / 1.24 |
+| **2 link (double), FF ON** | **0.53 / 2.02** | **0.44 / 1.63** |
+| 2 link (double), FF OFF | 1.18 / 4.62 | 1.00 / 2.99 |
+
+- **Single link** returns to the 0-arm baseline (the coupled FF reduces to it). ✓
+- **Double pendulum: FF cuts the disturbance ~2.2×** (lat 1.18→0.53, up 1.00→0.44; peaks roughly halved).
+  Residual ~2× the no-arm baseline — the double pendulum is genuinely harder (faster unstable pole,
+  larger reactions) and this is open-loop with no delay compensation. **Acceptance (FF ≫ off; bounded;
+  derivation matches truth): PASS.**
+
+### Smith prediction — deferred to Packet D
+Predicting the chain forward (`PEND_PREDICT_S > 0`) **helps lateral** (0.53→0.40) but **destabilises the
+vertical** (up RMS 0.44→0.82 at 18 ms; spikes ~9 m/s² at 10 ms): near aligned links (Δ≈0, common while
+hanging) the coupled EOM stiffens and prediction amplifies `θ̈`. Left at **`PEND_PREDICT_S = 0`** (robust
+on both axes). Tune with the real loop + balance controller in the loop (Packet D), not open-loop here.
+
+### Packets A and B are unaffected
+- **A** validated the *0-arm* accel response — no pendulum, topology-irrelevant.
+- **B** is a *sensor-degradation layer* — per-channel noise + latency on whatever θ/θ̇ channels are fed,
+  topology-independent; it already anticipated the series case (the arm-2 encoder is a *relative* joint
+  measurement). No rework.

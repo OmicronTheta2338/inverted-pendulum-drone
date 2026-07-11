@@ -131,6 +131,18 @@ var pend_rc := [1000, 1500, 1500, 1500, 1500]
 # which takes typed inputs instead of RC-PWM channels. Index 0/1 = arm0/arm1.
 var arm_theta := [0.0, 0.0]
 var arm_theta_dot := [0.0, 0.0]
+# ---- reaction-FF validation (env REACT_VALIDATE=1): compare the derived reaction FORMULA against the
+# TRUE reaction computed from the bobs' own accelerations (sum m_i (g_vec - a_bob_i)) -- an independent
+# check of the coupled-dynamics derivation, not the controller. Each arm's CoM IS its bob.
+var _rv_on := false
+var _rv_prev_b1 := Vector3.ZERO
+var _rv_prev_b2 := Vector3.ZERO
+var _rv_seeded := false
+var _rv_err_lat := 0.0
+var _rv_err_up := 0.0
+var _rv_ref_lat := 0.0
+var _rv_ref_up := 0.0
+var _rv_n := 0
 
 # ---- native in-process flight stack (ApFlightStack GDExtension): the ported mode-30 inner
 # loop + attitude/mixer, replacing the ArduPilot-over-UDP bridge to remove its round-trip lag.
@@ -239,6 +251,7 @@ func _ready() -> void:
 	reaction_ff_on = OS.get_environment("REACTION_FF") != "0"   # only "0" disables; arms stay attached either way
 	if not reaction_ff_on:
 		print("[accel] reaction-force FF DISABLED (REACTION_FF=0): arms swing but are NOT compensated")
+	_rv_on = OS.get_environment("REACT_VALIDATE") == "1"
 	lockstep = OS.get_environment("LOCKSTEP") == "1"
 	if lockstep:
 		print("[bridge] LOCKSTEP mode: tight 1:1 sync (lower latency, slower-than-real-time)")
@@ -342,6 +355,8 @@ func _physics_process(delta: float) -> void:
 	if auto_test:
 		_auto_drive()
 	_update_pendulum(delta)
+	if _rv_on:
+		_react_validate(a_total_world, delta)
 	if use_native:
 		_service_native(delta)
 	elif use_ardupilot:
@@ -910,6 +925,69 @@ func _update_pendulum(delta: float) -> void:
 		arm_theta_dot[i] = dtheta
 		pend_rc[1 + i * 2] = 1500 + int(round(clampf(theta, -PI, PI) / PI * 500.0))
 		pend_rc[2 + i * 2] = 1500 + int(round(clampf(dtheta, -PEND_RATE_MAX, PEND_RATE_MAX) / PEND_RATE_MAX * 500.0))
+
+
+# Independent check of the reaction-FF derivation: the TRUE reaction is sum_i m_i (g_vec - a_bob_i)
+# from each bob's finite-differenced world acceleration; the FORMULA re-derives it from (theta, rate,
+# a_d) via the coupled EOM -- IDENTICAL math to mode_accel.cpp. If the derivation is right they match.
+func _react_validate(a_d: Vector3, delta: float) -> void:
+	if n_arms < 1 or drone.global_position.y <= 0.0:
+		return
+	var dt := maxf(delta, 1e-6)
+	var g := GRAVITY
+	var ab1 := (arm_bodies[0].linear_velocity - _rv_prev_b1) / dt
+	var ab2 := Vector3.ZERO
+	_rv_prev_b1 = arm_bodies[0].linear_velocity
+	if n_arms >= 2:
+		ab2 = (arm_bodies[1].linear_velocity - _rv_prev_b2) / dt
+		_rv_prev_b2 = arm_bodies[1].linear_velocity
+	if not _rv_seeded:
+		_rv_seeded = true
+		return
+	var m1 := 0.10
+	var m2 := 0.10 if n_arms >= 2 else 0.0
+	# TRUE reaction (accel units = R / m_d); g_vec = (0, -g)
+	var rt_lat := m1 * (-ab1.x) + m2 * (-ab2.x)
+	var rt_up := m1 * (-g - ab1.y) + m2 * (-g - ab2.y)
+	# FORMULA reaction (identical to mode_accel.cpp) using the ACTUAL cart accel a_d; g_eff = g_vec - a_d
+	var gx := -a_d.x
+	var gy := -(g + a_d.y)
+	var M := m1 + m2
+	var L1 := 0.6
+	var L2 := 0.6
+	var th1 := float(arm_theta[0])
+	var w1 := float(arm_theta_dot[0])
+	var th2 := float(arm_theta[1]) if n_arms >= 2 else 0.0
+	var w2 := float(arm_theta_dot[1]) if n_arms >= 2 else 0.0
+	var c1 := cos(th1)
+	var s1 := sin(th1)
+	var c2 := cos(th2)
+	var s2 := sin(th2)
+	var dD := th1 - th2
+	var cD := cos(dD)
+	var sD := sin(dD)
+	var b1 := M * (gx * c1 + gy * s1) - m2 * L2 * sD * w2 * w2
+	var b2 := (gx * c2 + gy * s2) + L1 * sD * w1 * w1
+	var det := L1 * L2 * (M - m2 * cD * cD)
+	var dd1 := (L2 * b1 - m2 * L2 * cD * b2) / det
+	var dd2 := (-L1 * cD * b1 + M * L1 * b2) / det if n_arms >= 2 else 0.0
+	var rf_lat := M * gx - M * L1 * (dd1 * c1 - w1 * w1 * s1)
+	var rf_up := M * gy - M * L1 * (dd1 * s1 + w1 * w1 * c1)
+	if n_arms >= 2:
+		rf_lat -= m2 * L2 * (dd2 * c2 - w2 * w2 * s2)
+		rf_up -= m2 * L2 * (dd2 * s2 + w2 * w2 * c2)
+	_rv_err_lat += (rf_lat - rt_lat) * (rf_lat - rt_lat)
+	_rv_err_up += (rf_up - rt_up) * (rf_up - rt_up)
+	_rv_ref_lat += rt_lat * rt_lat
+	_rv_ref_up += rt_up * rt_up
+	_rv_n += 1
+	if _rv_n % 400 == 0:
+		var el := sqrt(_rv_err_lat / _rv_n)
+		var eu := sqrt(_rv_err_up / _rv_n)
+		var rl := sqrt(_rv_ref_lat / _rv_n)
+		var ru := sqrt(_rv_ref_up / _rv_n)
+		print("[react] n=%d | rms_err(lat,up)=(%.4f,%.4f) rms_true=(%.4f,%.4f) rel=(%.1f%%,%.1f%%)" % [
+			_rv_n, el, eu, rl, ru, 100.0 * el / maxf(rl, 1e-6), 100.0 * eu / maxf(ru, 1e-6)])
 
 
 func _pend_setup() -> void:
