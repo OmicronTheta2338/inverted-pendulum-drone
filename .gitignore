@@ -15,3 +15,7 @@ native/tests/test_flightstack
 
 # stray accidental file
 claude --resume*
+
+# local AI-assistant tooling config (keep out of the repo)
+.claude/
+CLAUDE.md
