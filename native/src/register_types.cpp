@@ -7,7 +7,11 @@
 
 #include "gdext_arm_balance.h"
 #include "gdext_two_arm_balance.h"
+#include "gdext_three_arm_balance.h"
 #include "gdext_flightstack.h"
+#include "gdext_flightstack3.h"
+#include "gdext_swingup.h"
+#include "gdext_swingup2.h"
 
 using namespace godot;
 
@@ -17,7 +21,11 @@ void initialize_armbalance_module(ModuleInitializationLevel p_level) {
     }
     GDREGISTER_CLASS(ArmBalance);
     GDREGISTER_CLASS(ArmBalance2);
+    GDREGISTER_CLASS(ArmBalance3);
     GDREGISTER_CLASS(ApFlightStack);
+    GDREGISTER_CLASS(ApFlightStack3);
+    GDREGISTER_CLASS(SwingUp);
+    GDREGISTER_CLASS(SwingUp2);
 }
 
 void uninitialize_armbalance_module(ModuleInitializationLevel p_level) {

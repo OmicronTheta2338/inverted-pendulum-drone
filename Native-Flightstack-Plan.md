@@ -206,6 +206,17 @@ FF-on clearly beats FF-off.
 
 ## Packet D — **Capstone:** balance controller on the real ModeAccel  *(Task 4)*
 
+> **Status: COMPLETE (2026-07-11).** Balance controller wired in-process (`BALANCE_ONBOARD=1`, `main.gd`) onto the
+> real native ModeAccel + coupled reaction FF + Packet-B sensor layer, geometry 0.7/0.6. **Single AND double
+> inverted pendulum balance ≥15 s under noise**, matching the idealized-cart (`balance_test`/`balance2_test`)
+> numbers; Monte-Carlo 8/8 seeds. The real ~25–30 ms effective-delay loop holds the arm as well as the assumed
+> 8 ms τ_cl. Empirical RHP break-test: the double falls at ~70 ms total effective delay (**p·τ ≈ 0.5**), ~2.5× the
+> nominal margin — the **rate**-channel latency is the killer, not the angle. Two design-changing findings: (1) the
+> reaction FF's *lateral* job is near-redundant with the balance loop (a bounded disturbance it rejects anyway);
+> its *vertical* arm-weight carry was the stability-critical part, now handled by an explicit **altitude-hold PD**;
+> (2) `up_stick=0` holds zero *accel* (permits a constant-velocity sink), so the vertical axis needs a position
+> loop. See appendix. *(memory: `packetD-capstone-validated`)*
+
 **Goal:** replace the idealized first-order cart with the real inner loop and close the
 full loop: **balance → real `ModeAccel` → Jolt plant (real hinged arm) → noisy/delayed
 sensors (Packet B) → balance.** Confirm 15 s upright.
@@ -587,3 +598,143 @@ on both axes). Tune with the real loop + balance controller in the loop (Packet 
 - **B** is a *sensor-degradation layer* — per-channel noise + latency on whatever θ/θ̇ channels are fed,
   topology-independent; it already anticipated the series case (the arm-2 encoder is a *relative* joint
   measurement). No rework.
+
+---
+
+## Appendix — Packet D (capstone: balance on the real ModeAccel)
+
+Closes the full loop: **balance controller → real native `ModeAccel` (overdrive FF + drag-cancel + coupled
+reaction FF) → Jolt plant (real hinged series arm) → Packet-B noisy/delayed sensors → balance.** The idealized
+first-order cart of `balance_test` (τ_cl = 8 ms, no overshoot, a *kinematic* cart the arm can't push) is gone; the
+balance loop now closes on the real inner layer, with the RHP pole in the loop for the first time.
+
+### Wiring (`BALANCE_ONBOARD=1`, `main.gd`)
+- Env-gated mode reusing `_service_native`. Builds `ArmBalance` (1 link) / `ArmBalance2` (2 links, 0.7/0.6 gains).
+- **Bring-up:** teleport the drone to `BALANCE_ALT` (10 m) at rest + level, re-anchor `Pivot`/`Pivot2`, erect the
+  arm(s) INVERTED with a small lean (`BALANCE_INIT_DEG`, default 4°) — the `balance2_test` IC on the real body.
+- **Command map:** `lat_stick = clamp(a_cmd / 12, ±1)` (`ACCEL_LAT_CMD_MSS` = 12, a clean 1:1).
+- **Convention (the bug-magnet):** `_update_pendulum` gives θ from straight-DOWN; the controller wants straight-UP:
+  `θ_up = wrap(π − θ_down)`, and the **rate flips sign** `θ̇_up = −θ̇_down`. The *same* sensed measurement feeds
+  BOTH the balance loop and the reaction FF, re-expressed per convention (not sensed twice).
+- **Vertical:** altitude-hold PD `up_stick = clamp((2·(alt_ref − alt) − 2·v_y) / g, ±1)` — see finding 2.
+- **Grader on truth:** metrics use the arm's own basis angle, independent of the sensed signal the loop closed on.
+
+### Results (15 s, geometry 0.7/0.6, native path, altitude held)
+| case | link1 max / final | link2 max / final | rms_u | sat |
+|---|---|---|---|---|
+| single, noise off | 4.00 / 0.013° | — | 0.21 | 0 |
+| single, noise on | 4.00 / 0.038° | — | 0.22 | 0 |
+| double, noise off | 5.02 / 0.005° | 4.00 / 0.002° | 0.37 | 0 |
+| double, noise on | 5.07 / 0.15° | 4.00 / 0.09° | 0.62 | 0 |
+| double + noise, **MC 8 seeds** | **8/8 PASS**, worst final 0.19° | ≤ 0.14° | ~0.6 | 0 |
+
+The arm never diverges past its start lean and settles to < 0.2°, never saturating — matching the idealized-cart
+`balance2_test` (§9: 5.1 / 4.0 max, < 0.4° final) essentially exactly. **The real inner loop holds the double
+inverted pendulum as well as the assumed 8 ms τ_cl model.** Capstone acceptance: **PASS**.
+
+### Finding 1 — the reaction FF's two jobs have different criticality (resolves FF-on/off)
+The reaction FF bundles (a) **lateral** dynamic-reaction cancellation and (b) **vertical** arm-weight carry.
+Turning the FF fully off (`REACTION_FF=0`) *with `up_stick=0`* crashed the drone — but the `[bal]` trace showed
+the **arms staying upright** (th1, th2 → 0) while **altitude sank 10 → 0**: the failure was the uncarried 0.2 kg
+arm weight, a VERTICAL fall, not a lateral-balance loss. With the arm weight carried by the altitude-hold PD
+instead, **FF-off balances identically to FF-on** (double + noise: max 5.09 vs 5.08, final 0.148 vs 0.163),
+holding even at a 0.6 m/s bump into saturation. So:
+- **Lateral reaction cancellation = performance**, and near-*redundant* with the balance loop — the loop closes on
+  the arm angle, which the reaction moves, so it rejects the uncancelled reaction as one more bounded disturbance.
+- **Vertical weight carry = stability-critical** (stay airborne), better done by an explicit altitude hold.
+- The reaction FF still earns its keep on the **accel-tracking spec** (Packets A/C) — a different objective than
+  balance. For balance specifically, altitude-hold + the balance loop suffice.
+
+### Finding 2 — `up_stick = 0` is zero-*accel* hold, not altitude hold
+ModeAccel's `up_stick = 0` commands zero vertical *acceleration*, which permits a constant-velocity sink (any small
+initial vertical velocity persists — the I-trim nulls accel, not velocity). The drone must actively hover while
+balancing (unlike the fixed-height kinematic cart), so the balance mode adds a gentle altitude-hold PD
+(kp = kd = 2, truth alt / v_y) → altitude holds ~10 m over the run.
+
+### Finding 3 — empirical RHP delay margin (the break-test Packet B deferred here)
+Sweeping arm-sensing latency to failure (double + noise, altitude held so the break is purely lateral):
+- **Angle only:** survives > 160 ms — the angle is NOT the RHP-critical channel; the clean **rate** channel
+  (θ̇, 2.5 ms) carries the pole stabilization, so delaying only the angle just makes centering sluggish
+  (final 0.16 → 0.23°).
+- **Angle + rate together** (`SENSOR_LAT_ARM_IMU_MS` = `SENSOR_LAT_ARM_RATE_MS`, a shared fusion latency): PASS to
+  40 ms (straining — final 0.39°, rms_u 2.63), **FAIL at 55 ms**.
+
+Break ≈ 47.5 ms arm-sense + ~22.5 ms (actuator ~15 + estimator filter ~5 + ZOH ~2.5) ≈ **70 ms total effective
+delay** = **p·τ ≈ 0.5** (p = 7.2 rad/s, 1/p = 139 ms). Textbook: the RHP-pole limit is p·τ < 1 (hard wall),
+practical margin ~0.3–0.5 — the loop breaks right at the practical edge. Nominal effective delay is ~25–30 ms
+(p·τ ≈ 0.2) → **~2.5× delay margin**, confirming the arithmetic budget empirically. **This sharpens Packet B: the
+killer is the arm RATE-channel latency (the θ̇ phase lead), not the angle.** (`PEND_PREDICT_S` is NOT the lever
+here — it is a reaction-FF Smith horizon, orthogonal to the balance loop's own feedback.)
+
+### vs Phase 8
+The idealized model (`balance_test`/`balance2_test`, pure-C++ plant) held the single arm to ~50 ms and the double
+to ~25 ms *measurement* latency. The real capstone loop — with the actual ~15 ms actuator, its overshoot, the
+coupled reaction, and Packet-B sensing — breaks the double at ~70 ms *total effective* delay and matches the
+idealized balance quality at nominal. **The separation was legitimate: the real inner loop lives inside the outer
+loop's delay budget with ~2.5× margin, and the overshoot the idealized model lacked never mattered (it rings
+out-of-band, ~10× above the pendulum's pole).**
+
+### Deferred / debt
+- `s, v` fed to the balance loop are **truth** world-X (slow cart-centering loop, off the RHP path); sensed-`s,v`
+  is a one-line upgrade.
+- Maneuver-coupled arm-angle bias (Packet-B assumption #4) still unmodelled — the #1 thing to add if hardware
+  balance proves fragile (it is a transient angle bias correlated with the very catch that stabilizes the pole).
+- `PEND_PREDICT_S` closed-loop tuning not pursued (loop passes with margin; it is the wrong lever for balance).
+- Packet E (retune) not triggered — the real loop held what the idealized model held.
+- 850 g / hardware recalibration remains out of scope (all of the above at the sim's 1.0 kg body).
+
+---
+
+## Appendix — Stretch goal: SERIES TRIPLE inverted pendulum (isolated sandbox)
+
+Exploratory extension beyond Packets 0–E: a series **triple** (L1=0.7, L2=L3=0.6 m, bobs 0.1 kg) in an
+**isolated** sandbox, so the validated 2-arm path (`mode_accel.*`, `main.gd`, `main.tscn`) stays
+byte-untouched. *"Separate first; merge if it survives"* (user's call). New files: `mode_accel3.{h,cpp}`
+(`ModeAccel3`, 0..3-link reaction; n≤2 byte-identical to `mode_accel`), `three_arm_balance_controller.*` +
+`ArmBalance3` (8-state LQR), `gdext_flightstack3.*` (`ApFlightStack3`), `native/tools/compute_lqr3.py`,
+`sim-v-1/main3.{tscn,gd}`.
+
+### Feasibility (`compute_lqr3.py`)
+- **Controllable: rank 8/8.** Series equal-length links don't degenerate (parallel would — different chain
+  positions → distinguishable mode shapes → one input sees all three modes).
+- **Fastest unstable pole p = 9.90 rad/s → 1/p = 101 ms** (double: 7.2 / 139 ms). τ/3 ≈ 34 ms.
+- Cross-checked two ways: the 8-state plant self-checks against `compute_lqr2` (n=2 → 7.2 rad/s + exact
+  gains), and against the user's **independent** fixed-base 3×3 `A` (trace 140, det 22409, ω²={98.0,35.6,6.4})
+  → same λ_max. Fixed-base gives τ; the 8-state adds controllability + gains (cart input).
+- **LQR gains ~3–8× the double** (k2≈+1640, k3≈−1127): **~0.4° on link 2 alone saturates the ±12 rail.**
+
+### Reaction FF (3×3 coupled EOM)
+Generalised `R = Σ mᵢ(g − a_bobᵢ)` with the coupled triple EOM (symmetric mass matrix
+`Aᵢⱼ = Lᵢ Lⱼ μ_max(i,j) cos(θᵢ−θⱼ)`, `μⱼ = Σ_{k≥j} mₖ`, explicit 3×3 solve). Reduces exactly to n≤2.
+`REACT_VALIDATE` vs truth (bobs' own dv/dt): **3.3 % lat / 2.8 % up** (Packet C double was 4.7 / 3.1). Correct.
+
+### Balance (`ArmBalance3` on `ModeAccel3`, 15 s)
+| case | link max (deg) | final (deg) | rms_u | sat |
+|---|---|---|---|---|
+| clean, 0.5° lean | 0.70 / 0.56 / 0.50 | ~0.001 | 0.07 | 0 |
+| **noise on, 0.5°** | **1.22 / 0.88 / 0.67** | **~0.2–0.3** | **2.17** | 0 |
+
+Balances clean AND under the 3-encoder sensor chain at nominal delay. Chatter `rms_u` 0.07→2.17 (30×,
+the big-gain × 0.15° sensor amplification) — bounded, non-fatal.
+
+### "Very tight," measured
+- **Delay break** (shared arm angle+rate latency, noise on, 0.5°): PASS ≤ 6 ticks (15 ms), FAIL ≥ 7 ticks
+  (17.5 ms) → break ≈ **16 ms injected → ~38 ms total effective delay → p·τ ≈ 0.38.** Nominal ~25 ms
+  (p·τ≈0.25) → **~1.5× margin** (double had 2.5×). **The user's τ/3 = 34 ms was the right call**; the
+  double's measured p·τ=0.5 is too optimistic for the triple (three modes stack phase lag). The **RATE**
+  channel is the killer (as Packet D).
+- **Catch basin**: a *uniform* lean survives ≥ 8° — but that's the gentle mode (gains cancel: −601+1640−1127
+  = −89). The **zigzag** mode (θ1+, θ2−, θ3+) commands ~38×/deg → **sub-degree**. A swing-up catch lands near
+  zigzag, so the practical catch basin is sub-degree.
+
+### Run it
+- Balance (F5 default): `godot --path sim-v-1 res://main3.tscn`
+- Headless balance: `BALANCE_ONBOARD=1 NUM_ARMS=3 [USE_SENSOR_NOISE=1] godot --headless --path sim-v-1 res://main3.tscn`
+- Reaction FF check: `AUTOTEST=1 REACT_VALIDATE=1 NUM_ARMS=3 godot --headless --path sim-v-1 res://main3.tscn`
+- Delay sweep: add `SENSOR_LAT_ARM_IMU_MS=n SENSOR_LAT_ARM_RATE_MS=n`
+
+### Verdict
+Technically works — balances the triple on the real inner loop, clean and noisy, at nominal delay. But
+genuinely tight: **~1.5× delay margin** (vs 2.5× double) and a **sub-degree catch basin**. Merging into the
+main path (generalise `mode_accel` to n-arm) is deferred pending a decision; a swing-up *to* the triple would
+be brutal (sub-degree catch, near the zigzag mode).
