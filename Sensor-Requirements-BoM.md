@@ -1,7 +1,7 @@
 # Sensor Requirements — Pendulum-Balancing Octocopter (for the BoM)
 
 The specs the real sensors must hit for the hardware to behave like the balance simulation. Every
-figure here is **backed out from the sim's sensor-noise model** (`sim-v-1/main.gd`, sensor layer). If a
+figure here is backed out from the sim's sensor-noise model (`sim-v-1/main.gd`, sensor layer). If a
 part meets these, the controller that swings up and balances the double pendulum in sim is running on
 inputs no worse than the real ones.
 
@@ -9,24 +9,24 @@ inputs no worse than the real ones.
 
 ## Read the numbers right — the load-bearing bit
 
-The sim's noise values are **per-sample RMS at the 400 Hz loop rate**, *not* datasheet units. Datasheets
-quote **noise density** (µg/√Hz, mdps/√Hz). Convert with:
+The sim's noise values are per-sample RMS at the 400 Hz loop rate, not datasheet units. Datasheets
+quote noise density (µg/√Hz, mdps/√Hz). Convert with:
 
 ```
 σ_sample = density × √BW
 ```
 
-Every "hardware target" below uses **BW = 200 Hz** (Nyquist — the worst case, all noise in-band). Any
-anti-alias or low-pass filter you add makes the real requirement *easier* than shown. **Shop against the
-density target, not the raw σ, or you will badly over-buy.**
+Every "hardware target" below uses BW = 200 Hz (Nyquist, the worst case, all noise in-band). Any
+anti-alias or low-pass filter you add makes the real requirement easier than shown. Shop against the
+density target rather than the raw σ, or you'll badly over-buy.
 
 ## Binding items — what to actually sweat
 
 Everything else on this sheet is met by any modern flight IMU. These four are the constraints; three are
 mechanical, not a purchase.
 
-1. **Optical flow + rangefinder** *(subsystem)* — the velocity/position enabler. GPS-denied, so 3 cm/s
-   velocity needs a flow sensor plus a rangefinder for scale. The whole fore/aft hold depends on it.
+1. **Optical flow + rangefinder** *(subsystem)* — what makes velocity and position possible. GPS-denied, so
+   3 cm/s velocity needs a flow sensor plus a rangefinder for scale. The whole fore/aft hold depends on it.
 2. **≥14-bit magnetic encoder + diametric magnet** *(part)* — arm-2 joint angle. Needs an on-axis chip
    and a magnet on the shaft; plan the mechanics, not just the BoM line.
 3. **Vibration isolation** *(mechanical)* — keep vibration at the flight IMU ≲ 25 mg RMS. Soft-mount the
@@ -48,7 +48,7 @@ Comfortably met by current parts; the only real constraint here is mechanical vi
 | Rate / latency | 2.5–8 ms, 400 Hz loop | ≥400 Hz out (≥1 kHz internal) · ≤8 ms | standard | Easy |
 
 The accel "noise" figure is dominated by the modelled rotor-vibration residual, so it's a
-**vibration-isolation** target, not a chip-selection one — no accelerometer datasheet fixes a shaking mount.
+vibration-isolation target, not a chip-selection one; no accelerometer datasheet fixes a shaking mount.
 
 ## State estimate — attitude / velocity / position
 
@@ -61,9 +61,9 @@ subsystem because the vehicle is GPS-denied.
 | **Velocity** | 0.03 m/s RMS · 20 ms lag | needs optical flow + rangefinder (3 cm/s indoors) | flow camera + TF-Luna / VL53L1X | **Binding** |
 | **Position** | 0.02 m RMS + drift 0.015 m/√s | position may drift; you need velocity *aiding*, not an absolute fix | (as above) | **Binding** |
 
-This is the one place the sim is **lenient in assumption but demanding in hardware**: it tolerates slow
+This is the one place the sim is lenient in assumption but demanding in hardware: it tolerates slow
 position drift, but holding 3 cm/s velocity with no external reference realistically requires a flow sensor
-plus a rangefinder for flow scale/altitude. **Scrutinise this line hardest.**
+plus a rangefinder for flow scale/altitude. Scrutinise this line hardest.
 
 ## Arm-angle sensors — the pendulum instrumentation
 
@@ -77,30 +77,30 @@ IMUs; arm 2 (distal) carries an over-the-joint magnetic encoder.
 | Arm 2 · angle | 0.10° RMS · LSB 0.05° (~13-bit) · 2.5 ms | ≥14-bit on-axis magnetic encoder + diametric magnet | AS5048A / AS5047P / MT6835 | Moderate |
 | Arm 2 · rate | 1.0 °/s RMS | differentiated encoder (noisier, expected) | (same encoder) | Easy |
 
-Arm-1's 0.15° is achievable noise-wise with any decent IMU because the gravity anchor is heavily low-passed
-— so **don't over-buy the IMU; buy mounting rigidity and alignment.** The residual maneuver-lean (the anchor
-tilting under lateral acceleration) is fundamental and no sensor removes it.
+Arm-1's 0.15° is achievable noise-wise with any decent IMU because the gravity anchor is heavily low-passed,
+so don't over-buy the IMU; buy mounting rigidity and alignment. The residual maneuver-lean (the anchor
+tilting under lateral acceleration) is fundamental, and no sensor removes it.
 
 **Verdict key:** *Easy* = any modern part clears it · *Moderate* = specific part or mechanical effort ·
 *Binding* = the constraint, scrutinise.
 
 ## Not captured by the sim
 
-Real requirements the sensor model does not represent — don't let their absence here drop them from the BoM.
+Real requirements the sensor model doesn't represent; don't let their absence here drop them from the BoM.
 
 - **Heading / magnetometer** — no compass or yaw source is modelled, but real ArduPilot will want one. Budget
   a compass or an alternative yaw reference.
 - **Temperature drift, scale-factor, misalignment** — all real IMU error terms, none in the model; factor into margin.
-- **Battery voltage / current sense** — the sim assumes the FC *cannot* compensate voltage sag, so it's not
-  strictly required — but a voltage sense is what would *let* you compensate it later. Worth a line.
+- **Battery voltage / current sense** — the sim assumes the FC cannot compensate voltage sag, so it's not
+  strictly required, but a voltage sense is what would let you compensate it later. Worth a line.
 
 ## These are soft targets
 
-The σ values were seeded as **mid-grade engineering guesses**, not hard-derived requirements. The BoM target is
-"match or beat these." If one turns out to be the **cost driver** — most likely the optical-flow subsystem or
-the encoder — the right move is *not* to pay for the guessed number: send the real candidate part's datasheet
-spec and re-run the balance demo at *that* number to confirm it still holds. That closes the loop the correct
-way round — the hardware sets the sim, not a guess setting the hardware.
+The σ values were seeded as mid-grade engineering guesses, not hard-derived requirements. The BoM target is
+"match or beat these." If one turns out to be the cost driver (most likely the optical-flow subsystem or
+the encoder), the right move isn't to pay for the guessed number: send the real candidate part's datasheet
+spec and re-run the balance demo at that number to confirm it still holds. That closes the loop the correct
+way round: the hardware sets the sim, not a guess setting the hardware.
 
 ## Appendix — raw sim parameters
 
