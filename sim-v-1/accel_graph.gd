@@ -40,6 +40,11 @@ func push_sample(t: float, a_cmd: float, a_real: float) -> void:
 	t_data.append(t)
 	cmd_data.append(a_cmd)
 	real_data.append(a_real)
+	# bound memory + per-frame draw cost: keep a few window-widths, trimmed in bulk (amortized O(1))
+	if t_data.size() > 3000:
+		t_data = t_data.slice(t_data.size() - 1500)
+		cmd_data = cmd_data.slice(cmd_data.size() - 1500)
+		real_data = real_data.slice(real_data.size() - 1500)
 	queue_redraw()
 
 
