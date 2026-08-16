@@ -17,11 +17,42 @@ const MASS := 1.0          # drone BODY mass [kg]. Authoritative: _ready() sets 
 const INERTIA := Vector3(0.01616, 0.04272, 0.02674)
 const K_M := 0.01
 const GRAVITY := 9.8
+const BODY_DRAG_K := 0.03   # A6: quadratic aero drag coeff [1/m]; F = -k|v|v applied at the CoM. Near-zero at
+							# the low speeds of actual use (~0.04 m/s^2 at 1 m/s), realistic ~quadratic shape.
+							# Replaces the old linear linear_damp=0.05 placeholder. Calibrate at hardware.
+const ARM_DRAG_K := 0.003      # A3: bob quadratic air drag [N·s²/m²] -- small (edge-on rod, low frontal area)
+const HINGE_VISC := 0.002      # A2: hinge VISCOUS friction [N·m·s/rad] (bearing + encoder drag)
+const HINGE_COUL := 0.003      # A2: hinge COULOMB (dry/stiction) friction [N·m]
+const HINGE_OMEGA_EPS := 0.05  # Coulomb smoothing half-width [rad/s]: below this friction ramps linearly (no chatter)
+const GYRO_KH := 0.0095         # A5: rotor gyro coeff = I_rotor/sqrt(k_T); h_i = KH*sqrt(T_i)*spin*axis [kg·m²/s]
+const C1_ANCHOR_GAIN := 0.15    # C1: residual fraction of the accel gravity-anchor tilt that leaks into arm-1
+								# angle after the 2xIMU differential rejects the common-mode part (small)
+const C1_TAU := 0.3             # C1: anchor low-pass [s] -- the gyro handles faster transients, so they don't leak
 const PEND_L := 0.6           # pivot->bob distance [m]; MUST match the Bob CollisionShape offset in main.tscn
 const PEND_RATE_MAX := 10.0   # rad/s full-scale for the theta-dot bridge channel; MUST match mode_accel.cpp PEND_RATE_MAX
 const T_MAX := 19.3          # F60PROV-LV 1950KV: 1966 g x 9.81 = 19.3 N max per motor
 const THRUST_EXPO := 0.35    # prop thrust curve thrust=(1-e)x+e x^2; MUST match MOT_THST_EXPO
-const MOTOR_TAU := 0.03      # motor+prop spin-up time constant [s] (estimate — measure on bench)
+# Motor+prop thrust lag is ASYMMETRIC: spin-UP dumps current into the prop (fast, current-limited);
+# spin-DOWN on a freewheeling ESC only sheds energy through aero drag (slower). Active motor braking
+# on the real ESC would pull TAU_DOWN back toward TAU_UP. Both are estimates — measure on the bench.
+const MOTOR_TAU_UP := 0.03    # thrust RISING time constant [s]
+const MOTOR_TAU_DOWN := 0.045 # thrust FALLING time constant [s] (~1.5x; = TAU_UP if ESC braking is on)
+
+# Battery sag: all 8 motors share ONE pack, so TOTAL thrust demand -- a proxy for total current, since
+# prop torque ~ thrust and BLDC current ~ torque -- droops the shared pack voltage:
+#     V/V_nom = 1 - BATT_SAG_K * sum(thrust_i).
+# At a fixed throttle position thrust ~ V^2, so EVERY motor's realized thrust scales by (V/V_nom)^2 at
+# once. This is a CORRELATED hit (unlike the per-motor lag/noise) that bites hardest at the catch's peak
+# demand, and the voltage-blind flight code cannot see it to compensate. Default ~ a good low-R pack.
+var batt_sag_k := 0.0008        # per-Newton voltage droop [1/N]; env BATT_SAG_K; 0 disables. BENCH-MEASURE.
+const BATT_SAG_FLOOR := 0.70    # clamp: never model deeper than 30% loss (current limiting / you'd back off)
+var _sag_factor := 1.0          # last tick's (V/V_nom)^2, applied to every motor (explicit -> no I<->V loop)
+
+# A4: advance-ratio thrust droop. Moving ALONG a motor's thrust axis raises its axial inflow, and a
+# fixed-pitch prop unloads (thrust falls with airspeed): T *= max(0, 1 - ADV_RATIO_K * v_axial), only for
+# v_axial>0. Unlike sag this is at FIXED RPM (aero, not electrical) -> it does NOT change rotor angular
+# momentum, so the gyro term keeps reading the un-drooped thrust. Small at demo speeds; conservative.
+var adv_ratio_k := 0.015        # thrust droop per (m/s) of axial inflow [s/m]; env ADV_RATIO_K; 0 disables. BENCH.
 const SITL_PORT := 9002
 const SITL_RECV_TIMEOUT_US := 100000
 const RC_CENTER := 1500      # neutral PWM (LOITER: hold position / altitude / heading)
@@ -52,6 +83,55 @@ var vert_level := 0   # -3..+3
 # PARK: SPACE engages auto-fly-to-(0,0,10m)-and-hold (signalled to ArduPilot on ch2).
 # Pressing any lateral/vertical accel key disengages it and resumes manual control.
 var park := false
+
+# ---- Packet D: onboard balance mode (env BALANCE_ONBOARD=1). The balance controller runs IN-PROCESS and
+# drives ModeAccel's lateral stick, closing the inverted-pendulum loop on the REAL accel inner loop (not the
+# idealized first-order cart of balance_test). Vertical axis hover-holds (up_stick=0); the reaction FF carries
+# the arm weight. Metrics graded on TRUTH arm angle. See Native-Flightstack-Plan.md, Packet D.
+var balance_onboard := false
+var balance_ctrl                          # ArmBalance (1 link) or ArmBalance2 (2 links) GDExtension
+var balance_init_deg := 4.0               # link1 start lean from upright (+ -> +X)
+var balance_init2_deg := 4.0              # link2 start lean (double only)
+var balance_alt := 10.0                   # hover altitude to balance at [m]
+const BAL_RUN_TIME := 20.0
+const BAL_GAINS2 := {"k1": -213.542773, "k1d": -14.504648, "k2": 260.829154,
+	"k2d": 45.149116, "ks": 1.414214, "kv": 4.525040}   # compute_lqr2.py, 0.7/0.6, R=1 (matches balance2_test)
+var _bal_t := 0.0
+var _bal_max1 := 0.0
+var _bal_max2 := 0.0
+var _bal_sum_cmd2 := 0.0
+var _bal_n := 0
+var _bal_sat := false
+var _bal_done := false
+var _bal_bump_t := 7.5
+var _bal_bump_dv := 0.0                    # mid-run lateral velocity bump [m/s] (0 = none); env BALANCE_BUMP_DV
+var _bal_bumped := false
+var bal_graph_u                            # live strip-chart: a_cmd vs REAL realised lateral accel
+var bal_graph_ang                          # live strip-chart: the two link angles
+var _bal_released := false                 # after BAL_RUN_TIME: stop balancing, let the arms drop, hold a hover
+var _bal_post_t := 0.0
+
+# ---- SWINGUP mode (env SWINGUP=1): energy-swingup from hanging -> catch into balance, on the REAL ModeAccel.
+# The portable C++ SwingUp controller drives lat_stick AND up_stick (it uses the vertical axis to pump).
+var swingup_onboard := false
+var swingup_ctrl                           # SwingUp (GDExtension)
+var swingup_alt := 10.0                    # hover altitude to swing up at [m]
+var swingup_init_deg := 5.0                # arm start lean from HANGING (breaks symmetric rest); env SWINGUP_INIT_DEG
+var swingup_hold_time := 8.0               # balance this long AFTER the catch, then RELEASE (arms drop); env SWINGUP_HOLD_TIME
+const SWINGUP_RUN_TIME := 18.0             # hard cap if never caught (swing up ~3-4 s + hold, then report)
+var _su_t := 0.0
+var _su_caught := false
+var _su_catch_t := 0.0
+var _su_max_up_after := 0.0                # worst |angle from up| after the catch [deg]
+var _su_max_up_hold := 0.0                 # (same, for the last few seconds) -- steady-state check
+var _su_done := false
+var _su_passed := false                     # graded result (set at release), for the headless quit code
+var _su_released := false                    # after the hold: stop balancing, let the arms drop, hold a hover
+var _su_post_t := 0.0                         # time since release (for the headless quit)
+var _su_dbg := 0.0
+var _su_graph_n := 0                         # tick counter to decimate the live strip-chart pushes
+var _su_lat_cmd := 0.0                      # last lat_stick*12 [m/s^2], for debug
+var _su_up_cmd := 0.0                       # last up_stick*g [m/s^2], for debug
 
 # ---- headless auto-test (set env AUTOTEST=1): scripted takeoff + accel profile, keyboard ignored.
 # Off by default, so manual flying is unaffected. profile rows: [t_end_s, lat_level(-4..4), vert_level(-3..3)]
@@ -121,7 +201,7 @@ var _imu_accel_world := Vector3.ZERO   # specific force (world frame): a_total -
 # feed-forward the reaction force each arm applies on the frame. A real rig reads these from a hinge encoder.
 var n_arms := 1
 var reaction_ff_on := true       # env REACTION_FF=0 -> arms stay physically attached but the controller is
-                                 # told 0 arms, i.e. the reaction-force FF is DISABLED (Packet C: FF-on vs FF-off)
+								 # told 0 arms, i.e. the reaction-force FF is DISABLED (Packet C: FF-on vs FF-off)
 var arm_bodies: Array[RigidBody3D] = []
 var arm_prev_theta: Array[float] = []
 var arm_has_prev: Array[bool] = []
@@ -162,7 +242,17 @@ const NATIVE_YAW_RATE := 0.7854       # rad/s (~45 deg/s) commanded per full Q/E
 @export var sensor_seed := 1
 # per-channel Gaussian 1-sigma (SI). accel folds a broadband vibration RMS into one sigma.
 @export var sig_gyro_dps := 0.05           # gyro noise [deg/s]              (Phase 4)
-@export var sig_accel := 0.35              # accel_ef noise [m/s^2] ~5mg + ~30mg vibration RMS
+@export var sig_accel := 0.25              # accel_ef broadband WHITE [m/s^2] ~5mg sensor + residual; the
+										   # coherent rotor line is pulled OUT into the vib tone below (C4).
+# C4: rotor-vibration TONE. Real IMU vibration is not white -- it is a throttle-coupled line at rotor
+# frequency, which the estimator can partly track / be fooled by (unlike white noise). Modelled as a
+# sinusoid: amplitude grows with total thrust (more throttle -> more vibration), frequency ~ sqrt(thrust)
+# (an RPM proxy), decorrelated phase per axis. At hover its RMS ~ the vibration part removed from sig_accel
+# above (power-preserving). NOTE: at the 400 Hz sensor tick this carries only sub-~200 Hz lines faithfully;
+# true high-frequency ALIASING into the control band would need a multi-rate IMU model (not present here).
+@export var vib_accel := 0.35              # tone amplitude at hover [m/s^2]; env VIB_ACCEL; 0 disables
+@export var vib_f_hover := 90.0            # tone fundamental at hover [Hz]; scales with sqrt(thrust)
+var _vib_phase := 0.0                       # rotor-tone phase accumulator [rad]
 @export var sig_att_deg := 0.1             # EKF attitude noise [deg]
 @export var sig_vel := 0.03                # velocity NED noise [m/s]        (IMU dead-reckoning)
 @export var sig_pos := 0.02                # position NED noise [m]
@@ -177,7 +267,9 @@ const NATIVE_YAW_RATE := 0.7854       # rad/s (~45 deg/s) commanded per full Q/E
 @export var enc_lsb_deg := 0.05            # arm-2 encoder quantization step [deg] (~13-bit)
 @export var sig_thetadot0_dps := 0.4       # arm-1 rate [deg/s] (differential gyro, clean)
 @export var sig_thetadot1_dps := 1.0       # arm-2 rate [deg/s] (differentiated encoder, noisier)
-@export var pos_drift_rate := 0.05         # dead-reckon position random-walk [m/sqrt(s)]
+@export var pos_drift_rate := 0.015        # dead-reckon position random-walk [m/sqrt(s)]. Was 0.05 (Packet-B
+										   # placeholder); at 0.05 the fore/aft hold, having no absolute ref,
+										   # tracked the drift out to ~1 m. Tighter guess -> forward holds <~0.2 m.
 # per-group measurement latency / EKF lag [ms] -> ring-buffer depth (rounded to ticks)
 @export var lat_imu_ms := 2.5              # accel_ef, gyro (raw INS, ~loop rate)
 @export var lat_ekf_att_ms := 8.0          # EKF attitude output-observer lag
@@ -199,6 +291,7 @@ var _d_arm := 1
 var _d_arm_imu := 3                        # arm-1 IMU-fused ANGLE latency (deeper than clean arm chans)
 var _gyro_bias := Vector3.ZERO             # slow gyro bias (random walk)
 var _pos_drift := Vector3.ZERO             # accumulated dead-reckon position drift (NED)
+var _c1_alat_lp := 0.0                     # C1: low-passed lateral specific force (maneuver-coupled arm bias)
 
 # ---- diagnostics (remove once timing is understood) ----
 var _diag_rt := 0           # round-trips (state replies) since last report
@@ -216,10 +309,9 @@ func _ready() -> void:
 	drone.center_of_mass_mode = RigidBody3D.CENTER_OF_MASS_MODE_CUSTOM
 	drone.center_of_mass = Vector3.ZERO
 	drone.linear_damp_mode = RigidBody3D.DAMP_MODE_REPLACE
-	drone.linear_damp = 0.05   # low-speed drag, realistic for a small ~0.8 kg drone. Was 0.3 — an
-							   # arbitrary overestimate (~0.5 g of drag at 17 m/s) that swamped the
-							   # vertical axis. Real drag is ~quadratic + near-zero at the low speeds
-							   # of actual use; this linear coeff is a placeholder — calibrate later.
+	drone.linear_damp = 0.0    # Godot's built-in damping is LINEAR (a=-c*v), which over-damps at low speed.
+							   # Replaced by an explicit QUADRATIC drag (F=-k|v|v, BODY_DRAG_K) in _apply_forces
+							   # -- realistic shape, near-zero at the low speeds of actual use. See A6.
 	drone.angular_damp_mode = RigidBody3D.DAMP_MODE_REPLACE
 	drone.angular_damp = 0.0
 
@@ -230,6 +322,15 @@ func _ready() -> void:
 	if pendulum_test:
 		_pend_setup()
 		return
+	# A plain editor "Run" (F5) sets no env vars -> default to the SWING-UP demo (native + noise + 2-arm
+	# double: swing up -> catch -> hold -> release). Any explicit env var (a headless test command) still
+	# selects its own mode (e.g. BALANCE_ONBOARD=1 for the balance demo).
+	var editor_demo := OS.get_environment("NUM_ARMS") == "" and OS.get_environment("ENABLE_PENDULUM") == "" \
+		and OS.get_environment("AUTOTEST") == "" and OS.get_environment("USE_NATIVE") == "" \
+		and OS.get_environment("BALANCE_ONBOARD") == "" and OS.get_environment("SWINGUP") == ""
+	if editor_demo:
+		sensor_noise_enabled = true
+
 	# Arm count: NUM_ARMS (0/1/2) wins; else ENABLE_PENDULUM (0 -> bare, 1 -> one arm) so the older
 	# harness still works. The accel-mode calibration was done BARE; the reaction-force feed-forward in
 	# the controller now lets it hold the accel spec with 1 or 2 arms too.
@@ -243,6 +344,8 @@ func _ready() -> void:
 		elif ep == "1" or ep == "true":
 			enable_pendulum = true
 		n_arms = 1 if enable_pendulum else 0
+	if editor_demo:
+		n_arms = 2
 	_setup_arms()
 
 	auto_test = OS.get_environment("AUTOTEST") == "1"
@@ -252,13 +355,22 @@ func _ready() -> void:
 	if not reaction_ff_on:
 		print("[accel] reaction-force FF DISABLED (REACTION_FF=0): arms swing but are NOT compensated")
 	_rv_on = OS.get_environment("REACT_VALIDATE") == "1"
+	var bsk := OS.get_environment("BATT_SAG_K"); if bsk != "": batt_sag_k = float(bsk)
+	var ark := OS.get_environment("ADV_RATIO_K"); if ark != "": adv_ratio_k = float(ark)
+	var vak := OS.get_environment("VIB_ACCEL"); if vak != "": vib_accel = float(vak)
+	balance_onboard = OS.get_environment("BALANCE_ONBOARD") == "1"
+	swingup_onboard = editor_demo or OS.get_environment("SWINGUP") == "1"
+	if swingup_onboard:
+		var siv := OS.get_environment("SWINGUP_INIT_DEG"); if siv != "": swingup_init_deg = float(siv)
+		var sav := OS.get_environment("SWINGUP_ALT");      if sav != "": swingup_alt = float(sav)
+		var shv := OS.get_environment("SWINGUP_HOLD_TIME"); if shv != "": swingup_hold_time = float(shv)
 	lockstep = OS.get_environment("LOCKSTEP") == "1"
 	if lockstep:
 		print("[bridge] LOCKSTEP mode: tight 1:1 sync (lower latency, slower-than-real-time)")
 
 	# NATIVE flight stack (env USE_NATIVE=1 or the export flag): run the ported mode-30 loop
 	# in-process and DISABLE the UDP bridge, so there is no round-trip latency to hide.
-	if OS.get_environment("USE_NATIVE") == "1":
+	if editor_demo or OS.get_environment("USE_NATIVE") == "1" or swingup_onboard:
 		use_native = true
 	if use_native:
 		use_ardupilot = false
@@ -277,6 +389,20 @@ func _ready() -> void:
 		var hover_each := MASS * GRAVITY / 4.0
 		motor_thrust = [hover_each, hover_each, hover_each, hover_each, 0, 0, 0, 0]
 		motor_cmd = motor_thrust.duplicate()
+
+	if balance_onboard:
+		if n_arms >= 1:
+			_balance_setup()
+		else:
+			push_warning("[bal] BALANCE_ONBOARD needs NUM_ARMS>=1; ignoring")
+			balance_onboard = false
+
+	if swingup_onboard:
+		if n_arms >= 1:
+			_swingup_setup()
+		else:
+			push_warning("[swingup] SWINGUP needs NUM_ARMS>=1; ignoring")
+			swingup_onboard = false
 
 	print("ACCEL mode (30) keys — focus this window. LATCHING: last key sets a held accel.")
 	print("  Lateral  A S D F [G] H J K L : A=max-left(-5g) ... G=zero/coast ... L=max-right(+5g)")
@@ -355,6 +481,7 @@ func _physics_process(delta: float) -> void:
 	if auto_test:
 		_auto_drive()
 	_update_pendulum(delta)
+	_apply_arm_damping()
 	if _rv_on:
 		_react_validate(a_total_world, delta)
 	if use_native:
@@ -496,13 +623,78 @@ func _service_native(delta: float) -> void:
 
 	flightstack.set_state(accel_ef, vel_ned, pos_ned, true, true, quat, gyro_frd)
 
-	# command: latched keyboard levels -> normalized sticks; Q/E -> yaw rate; SPACE -> park.
+	# command: BALANCE_ONBOARD -> the balance controller drives lat_stick (closing the pendulum loop on the
+	# REAL accel inner loop); else latched keyboard levels -> normalized sticks; Q/E -> yaw rate; SPACE -> park.
 	# (auto_test drives lat_level/vert_level/park via _auto_drive, exactly as in the bridge path.)
 	var lat_stick := lat_level / 4.0
 	var up_stick := vert_level / 3.0
 	var yaw := 0.0
-	if Input.is_key_pressed(KEY_E): yaw += 1.0
-	if Input.is_key_pressed(KEY_Q): yaw -= 1.0
+	if swingup_onboard and not _su_released:
+		# SWINGUP: the portable C++ SwingUp controller drives BOTH sticks. It pumps energy (lateral +
+		# vertical) from hanging, then gates into the ArmBalance LQR once inside the measured basin. th0/td0
+		# are the SENSED arm state (from straight-DOWN); s,v,h,vy are the drone cart state (truth, slow loop).
+		var s_lat := drone.global_position.x
+		var v_lat := drone.linear_velocity.x
+		var h_dev := drone.global_position.y - swingup_alt
+		var vy := drone.linear_velocity.y
+		var o: Dictionary
+		if n_arms >= 2:   # SwingUp2 also needs link2's sensed angle/rate
+			o = swingup_ctrl.update(th0, td0, th1, td1, s_lat, v_lat, h_dev, vy, delta)
+		else:
+			o = swingup_ctrl.update(th0, td0, s_lat, v_lat, h_dev, vy, delta)
+		lat_stick = clampf(float(o["a_lat"]) / 12.0, -1.0, 1.0)   # ACCEL_LAT_CMD_MSS=12
+		up_stick = clampf(float(o["a_up"]) / GRAVITY, -1.0, 1.0)  # a_up in [-g,+g] -> up_stick in [-1,1]
+		_su_lat_cmd = float(o["a_lat"]); _su_up_cmd = float(o["a_up"])
+		yaw = 0.0
+		park = false
+		_swingup_record(delta, bool(o["balancing"]))
+	elif swingup_onboard:
+		# hold elapsed -> RELEASE: stop driving the arms, let them fall; the drone just holds a hover.
+		# Reaction FF stays on (n_arms passed below) so the dropping arms barely shove the frame.
+		lat_stick = clampf((-1.5 * drone.global_position.x - 3.0 * drone.linear_velocity.x) / 12.0, -1.0, 1.0)
+		up_stick = clampf((2.0 * (swingup_alt - drone.global_position.y) - 2.0 * drone.linear_velocity.y) / GRAVITY, -1.0, 1.0)
+		park = false
+		_su_post_t += delta
+		if DisplayServer.get_name() == "headless" and _su_post_t >= 3.0:
+			print("[swingup] post-release +%.1fs: alt=%.2f lat=%.2f (arms dropped, drone held hover)" % [
+				_su_post_t, drone.global_position.y, drone.global_position.x])
+			get_tree().quit(0 if _su_passed else 2)
+	elif balance_onboard and not _bal_released:
+		# Feed the balance controller the SAME sensed arm state the reaction FF gets, re-expressed in ITS
+		# convention: th0/td0 are sensed from straight-DOWN, so theta_up = wrap(PI - theta_down) and the rate
+		# FLIPS SIGN (theta_dot_up = -theta_dot_down). s,v = drone lateral (world-X) pos/vel (truth, slow loop).
+		var s_lat := drone.global_position.x
+		var v_lat := drone.linear_velocity.x
+		var a_cmd := 0.0
+		if n_arms >= 2:
+			a_cmd = balance_ctrl.update(wrapf(PI - th0, -PI, PI), -td0,
+				wrapf(PI - th1, -PI, PI), -td1, s_lat, v_lat, delta)
+		else:
+			a_cmd = balance_ctrl.update(wrapf(PI - th0, -PI, PI), -td0, s_lat, v_lat, delta)
+		if balance_ctrl.last_saturated():
+			_bal_sat = true
+		lat_stick = clampf(a_cmd / 12.0, -1.0, 1.0)   # ACCEL_LAT_CMD_MSS=12: full lateral stick = 12 m/s^2
+		# vertical: gentle altitude-hold PD -> vertical accel command. up_stick=0 alone holds zero ACCEL,
+		# which permits a constant-velocity sink (esp. with the arm weight uncarried when FF is off); a
+		# position/velocity PD holds altitude and decouples "stay airborne" from the reaction FF. (truth alt/vy.)
+		var alt_err := balance_alt - drone.global_position.y
+		up_stick = clampf((2.0 * alt_err - 2.0 * drone.linear_velocity.y) / GRAVITY, -1.0, 1.0)
+		park = false
+		_bal_record(delta, a_cmd)
+	elif balance_onboard:
+		# BAL_RUN_TIME elapsed: balance OFF -> the links drop freely; the drone just holds a hover.
+		# The reaction FF stays on (n_arms passed below), so the falling arms barely shove the frame.
+		lat_stick = clampf((-1.5 * drone.global_position.x - 3.0 * drone.linear_velocity.x) / 12.0, -1.0, 1.0)
+		up_stick = clampf((2.0 * (balance_alt - drone.global_position.y) - 2.0 * drone.linear_velocity.y) / GRAVITY, -1.0, 1.0)
+		park = false
+		_bal_post_t += delta
+		if DisplayServer.get_name() == "headless" and _bal_post_t >= 3.0:
+			print("[bal] post-release hover +%.1fs: alt=%.2f lat=%.2f fwd=%.2f (arms dropped, drone held)" % [
+				_bal_post_t, drone.global_position.y, drone.global_position.x, drone.global_position.z])
+			get_tree().quit(0)
+	else:
+		if Input.is_key_pressed(KEY_E): yaw += 1.0
+		if Input.is_key_pressed(KEY_Q): yaw -= 1.0
 	# reaction_ff_on=false -> tell the controller 0 arms so its reaction FF is skipped, while the physical
 	# arms (built from n_arms) keep swinging -> isolates the FF's effect in the truth-based grader.
 	flightstack.set_command(lat_stick, up_stick, yaw * NATIVE_YAW_RATE, park,
@@ -526,6 +718,7 @@ func _sensor_setup() -> void:
 	v = OS.get_environment("SENSOR_LAT_EKF_VEL_MS");    if v != "": lat_ekf_vel_ms = float(v)
 	v = OS.get_environment("SENSOR_LAT_EKF_POS_MS");    if v != "": lat_ekf_pos_ms = float(v)
 	v = OS.get_environment("SENSOR_LAT_ARM_IMU_MS");    if v != "": lat_arm_ang_imu_ms = float(v)
+	v = OS.get_environment("SENSOR_LAT_ARM_RATE_MS");   if v != "": lat_arm_ms = float(v)
 	sensor_rng.seed = sensor_seed
 
 	# ring-buffer sized to the largest latency; per-group depths in ticks
@@ -557,8 +750,18 @@ func _sensed_state(truth: Dictionary, dt: float) -> Dictionary:
 	var sg := sig_gyro_dps * d2r
 	var gyro_n: Vector3 = truth["gyro"] + _gyro_bias + Vector3(g.randfn(), g.randfn(), g.randfn()) * sg
 
-	# accel_ef: white noise (folds the broadband vibration RMS into one sigma)
+	# accel_ef: broadband white noise + a coherent rotor-vibration tone (C4).
 	var accel_n: Vector3 = truth["accel_ef"] + Vector3(g.randfn(), g.randfn(), g.randfn()) * sig_accel
+	# rotor tone: throttle-coupled amplitude, sqrt(thrust) frequency (RPM proxy), decorrelated phase/axis.
+	if vib_accel > 0.0:
+		var total_T := 0.0
+		for i in range(8):
+			total_T += motor_thrust[i]
+		var load := clampf(total_T / maxf(MASS * GRAVITY, 1e-3), 0.0, 4.0)   # 1.0 at hover; cap runaway
+		if load > 0.0:
+			_vib_phase = fposmod(_vib_phase + TAU * (vib_f_hover * sqrt(load)) * dt, TAU)
+			var amp := vib_accel * load                                       # imbalance force ∝ thrust
+			accel_n += Vector3(sin(_vib_phase), sin(_vib_phase + 2.094), sin(_vib_phase + 4.189)) * amp
 
 	# attitude: small random body rotation on the quaternion
 	var sa := sig_att_deg * d2r
@@ -577,7 +780,13 @@ func _sensed_state(truth: Dictionary, dt: float) -> Dictionary:
 	# rate. NOTE (documented simplification): the maneuver-coupled angle error -- the accel gravity
 	# anchor tilting under the drone's catch acceleration -- is NOT modelled here; only its extra
 	# fusion LATENCY is (read back at _d_arm_imu below). Revisit at hardware / if Packet D is fragile.
-	var th0: float = float(truth["theta0"]) + g.randfn() * (sig_theta0_deg * d2r)
+	# C1: maneuver-coupled arm-1 angle bias -- the 2xIMU gravity anchor leans under the drone's lateral accel.
+	# Differential IMUs reject the common-mode part, so only a small low-passed residual leaks (the gyro handles
+	# the fast transient). a_lat = accel_ef.y (= world-X specific force at yaw~0).
+	var a_lat_sf := float((truth["accel_ef"] as Vector3).y)
+	_c1_alat_lp += (a_lat_sf - _c1_alat_lp) * (1.0 - exp(-dt / C1_TAU))
+	var th0_bias := C1_ANCHOR_GAIN * atan2(_c1_alat_lp, GRAVITY)
+	var th0: float = float(truth["theta0"]) + th0_bias + g.randfn() * (sig_theta0_deg * d2r)
 	var td0: float = float(truth["tdot0"]) + g.randfn() * (sig_thetadot0_dps * d2r)
 	# arm 2 (distal): the magnetic encoder sits OVER THE JOINT, so it measures the RELATIVE angle
 	# phi = theta2 - theta1 (known "exactly", to the LSB), NOT theta2 absolute. Link2 carries no
@@ -652,14 +861,22 @@ func _diag_report() -> void:
 	_diag_t0 = now
 
 
-# First-order motor+prop spin-up lag: thrust cannot change instantly. Slew the
-# actual thrust toward the commanded thrust with time constant MOTOR_TAU. This is
-# what gives the vertical/attitude loops realistic phase margin — without it the
-# sim reacts to throttle instantly and oscillates worse than real hardware would.
+# First-order motor+prop lag: thrust cannot change instantly. Slew the actual thrust toward the
+# commanded thrust — ASYMMETRICALLY (rising: fast TAU_UP; falling: slow TAU_DOWN, so a rapid catch
+# reversal is paced by spin-DOWN) — and toward a BATTERY-SAGGED ceiling: the shared pack voltage droops
+# with total thrust, so the achievable thrust for a given PWM is motor_cmd * _sag_factor. The sag reads
+# last tick's realized total (explicit), which avoids a current<->voltage algebraic loop within a tick.
 func _apply_motor_lag(dt: float) -> void:
-	var alpha := 1.0 - exp(-dt / MOTOR_TAU)
+	var total_T := 0.0
 	for i in range(8):
-		motor_thrust[i] += (motor_cmd[i] - motor_thrust[i]) * alpha
+		total_T += motor_thrust[i]
+	var v_ratio := maxf(0.0, 1.0 - batt_sag_k * total_T)   # V/V_nom
+	_sag_factor = maxf(BATT_SAG_FLOOR, v_ratio * v_ratio)  # thrust ∝ V² at fixed throttle
+	for i in range(8):
+		var target := motor_cmd[i] * _sag_factor           # same PWM → less thrust when the pack sags
+		var tau := MOTOR_TAU_UP if target >= motor_thrust[i] else MOTOR_TAU_DOWN
+		var alpha := 1.0 - exp(-dt / tau)
+		motor_thrust[i] += (target - motor_thrust[i]) * alpha
 
 
 func _pwm_to_thrust(pwm: int) -> float:
@@ -672,12 +889,58 @@ func _pwm_to_thrust(pwm: int) -> float:
 
 func _apply_forces() -> void:
 	var basis := drone.global_transform.basis
+	var v_world := drone.linear_velocity
 	for i in range(8):
 		var T: float = motor_thrust[i]
 		if T == 0.0:
 			continue
-		drone.apply_force(basis * (motor_dir[i] * T), basis * motor_pos[i])
-		drone.apply_torque(basis * (motor_dir[i] * (motor_spin[i] * K_M * T)))
+		var axis_w := basis * motor_dir[i]              # world-frame thrust direction of this motor
+		# A4: advance-ratio droop -- unload the prop as the vehicle advances into its own thrust axis.
+		var v_ax := v_world.dot(axis_w)
+		if v_ax > 0.0:
+			T *= maxf(0.0, 1.0 - adv_ratio_k * v_ax)
+		drone.apply_force(axis_w * T, basis * motor_pos[i])
+		drone.apply_torque(axis_w * (motor_spin[i] * K_M * T))
+	# A6: quadratic aerodynamic body drag, F = -k|v|v (replaces the linear linear_damp placeholder).
+	# At the CoM so it adds no spurious moment; the dv/dt IMU sees it, so the controller feels real drag.
+	var v_body := drone.linear_velocity
+	var sp := v_body.length()
+	if sp > 1e-3:
+		drone.apply_central_force(-BODY_DRAG_K * sp * v_body)
+	# A5: rotor gyroscopic reaction. Each rotor carries angular momentum h_i along its (body) thrust axis;
+	# under body rate Ω the rotors react on the frame with τ = -Ω × ΣH_i. Counter-rotating pairs cancel ΣH
+	# at balanced thrust -> this only appears under the differential thrust of a real maneuver.
+	var H := Vector3.ZERO
+	for i in range(8):
+		if motor_thrust[i] > 0.0:
+			H += basis * (motor_dir[i] * (GYRO_KH * sqrt(motor_thrust[i]) * motor_spin[i]))
+	drone.apply_torque(-drone.angular_velocity.cross(H))
+
+
+# A2 + A3: realistic pendulum dissipation, so the arms DECAY like a real rig instead of swinging forever.
+# A3 = quadratic air drag on each bob; A2 = viscous + (smoothed) Coulomb friction at each hinge, opposing the
+# RELATIVE swing rate about the hinge axis. The controllers do NOT model this (a real hinge's friction is
+# unmodelled too), so it also exercises disturbance rejection. Hinge axis is body-Z of the parent link.
+func _apply_arm_damping() -> void:
+	if n_arms <= 0 or drone.global_position.y <= 0.0:
+		return
+	for a in arm_bodies:
+		var v: Vector3 = a.linear_velocity
+		var sp := v.length()
+		if sp > 1e-3:
+			a.apply_central_force(-ARM_DRAG_K * sp * v)               # A3: bob air drag
+	_hinge_friction(drone, arm_bodies[0], drone.global_transform.basis * Vector3(0, 0, 1))   # root hinge
+	if n_arms >= 2:
+		_hinge_friction(arm_bodies[0], arm_bodies[1], arm_bodies[0].global_transform.basis * Vector3(0, 0, 1))
+
+
+# Equal-and-opposite friction torque about a hinge axis: viscous (∝ rate) + Coulomb (∝ sign, ramped near 0).
+func _hinge_friction(a: RigidBody3D, b: RigidBody3D, axis: Vector3) -> void:
+	var w_rel := (b.angular_velocity - a.angular_velocity).dot(axis)   # relative swing rate about the hinge
+	var coul := clampf(w_rel / HINGE_OMEGA_EPS, -1.0, 1.0)             # smoothed sign(): no chatter through 0
+	var tvec := axis * (-(HINGE_VISC * w_rel + HINGE_COUL * coul))
+	b.apply_torque(tvec)
+	a.apply_torque(-tvec)
 
 
 func _ground_clamp() -> void:
@@ -890,6 +1153,22 @@ var _pend_cross: Array = []
 var _pend_done := false
 
 
+# A1: replace the point-mass-on-a-massless-rod arm with a realistic DISTRIBUTED mass -- a uniform rod
+# (fraction rod_frac of the mass) plus a tip mass (the bob/sensor) at L. This shifts the CoM in from L to
+# d and lowers the swing inertia, so the arm swings ~10% faster than the point-mass model the controllers
+# assume. Set via center_of_mass + inertia (overrides the collision-shape-derived values). rod_frac=0 -> the
+# old point mass at L; rod_frac=1 -> a bare uniform rod. Env ARM_ROD_FRAC sweeps it.
+func _set_arm_distribution(arm: RigidBody3D, L: float, total: float, rod_frac: float) -> void:
+	var m_rod := total * rod_frac
+	var m_tip := total * (1.0 - rod_frac)
+	var d := (m_rod * (L * 0.5) + m_tip * L) / total                       # CoM distance from the pivot
+	var i_cm := m_rod * L * L / 12.0 + m_rod * pow(L * 0.5 - d, 2) + m_tip * pow(L - d, 2)  # about CoM, swing axis
+	arm.mass = total
+	arm.center_of_mass_mode = RigidBody3D.CENTER_OF_MASS_MODE_CUSTOM
+	arm.center_of_mass = Vector3(0, -d, 0)
+	arm.inertia = Vector3(i_cm, maxf(i_cm * 1e-3, 1e-7), i_cm)             # thin rod: ~0 about its own long (Y) axis
+
+
 # Attach the first n_arms pendulums; fully detach the rest. IMPORTANT: to detach we clear BOTH joint
 # node paths. Clearing only node_b (the old code) leaves node_a=Drone, which makes Godot anchor the
 # DRONE to a fixed point in the world -> it can never take off (that was the 0-arm takeoff regression).
@@ -909,7 +1188,303 @@ func _setup_arms() -> void:
 			pivots[i].node_b = NodePath("")
 			pivots[i].queue_free()
 			bodies[i].queue_free()
-	print("[arms] %d pendulum arm(s) attached" % n_arms)
+	# A1: give each active arm a realistic distributed (rod + tip) mass instead of a point mass at L.
+	var arm_len := [0.7, 0.6]
+	var rod_frac := 0.7
+	var rf := OS.get_environment("ARM_ROD_FRAC")
+	if rf != "": rod_frac = float(rf)
+	for i in range(arm_bodies.size()):
+		_set_arm_distribution(arm_bodies[i], float(arm_len[i]), 0.1, rod_frac)
+	print("[arms] %d pendulum arm(s) attached; distributed rod_frac=%.2f (0=point@L, 1=uniform rod)" % [n_arms, rod_frac])
+
+
+# ============ Packet D: onboard balance mode ============
+# Build the balance controller, teleport the drone to a hover altitude, and erect the arm(s) INVERTED with a
+# small lean -- the same IC as balance2_test but on the REAL dynamical drone (ModeAccel hover-holds vertically
+# while the balance loop works the lateral axis).
+func _balance_setup() -> void:
+	var bv := OS.get_environment("BALANCE_INIT_DEG");  if bv != "": balance_init_deg = float(bv)
+	bv = OS.get_environment("BALANCE_INIT2_DEG"); if bv != "": balance_init2_deg = float(bv)
+	bv = OS.get_environment("BALANCE_ALT");       if bv != "": balance_alt = float(bv)
+	bv = OS.get_environment("BALANCE_BUMP_DV");   if bv != "": _bal_bump_dv = float(bv)
+
+	# controller: portable C++ core. ArmBalance2 = MIMO-LQR for the 0.7/0.6 double; ArmBalance = single-link LQR.
+	if n_arms >= 2:
+		var cfg := {"L1": 0.7, "L2": 0.6, "g": GRAVITY, "a_max": 12.0, "s_ref": 0.0}
+		for k in BAL_GAINS2:
+			cfg[k] = BAL_GAINS2[k]
+		balance_ctrl = ArmBalance2.new()
+		balance_ctrl.configure(cfg)
+	else:
+		balance_ctrl = ArmBalance.new()
+		balance_ctrl.configure({"L": 0.7, "g": GRAVITY, "a_max": 12.0, "s_ref": 0.0})
+
+	# teleport the drone to a hover altitude, at rest and level; re-anchor the root hinge there
+	drone.global_position = Vector3(0.0, balance_alt, 0.0)
+	drone.linear_velocity = Vector3.ZERO
+	drone.angular_velocity = Vector3.ZERO
+	var dxf := drone.global_transform
+	dxf.basis = Basis()
+	drone.global_transform = dxf
+	$Pivot.global_transform = Transform3D(Basis.IDENTITY, drone.global_position)
+
+	# link1 inverted from the drone (bob UP) + small lean; theta measured from straight up, + toward +X
+	var th1_0 := deg_to_rad(balance_init_deg)
+	arm_bodies[0].global_transform = Transform3D(Basis(Vector3(0, 0, 1), PI - th1_0), drone.global_position)
+	arm_bodies[0].linear_velocity = Vector3.ZERO
+	arm_bodies[0].angular_velocity = Vector3.ZERO
+
+	# link2 (double only): inverted from link1's TIP (0.7 m along the inverted link1)
+	if n_arms >= 2:
+		var tip: Vector3 = arm_bodies[0].global_transform * Vector3(0.0, -0.7, 0.0)
+		var th2_0 := deg_to_rad(balance_init2_deg)
+		arm_bodies[1].global_transform = Transform3D(Basis(Vector3(0, 0, 1), PI - th2_0), tip)
+		arm_bodies[1].linear_velocity = Vector3.ZERO
+		arm_bodies[1].angular_velocity = Vector3.ZERO
+		$Pivot2.global_transform = Transform3D(Basis.IDENTITY, tip)
+
+	print("[bal] BALANCE_ONBOARD active: %d link(s), alt=%.1f m, init=(%.1f, %.1f) deg, bump_dv=%.2f" % [
+		n_arms, balance_alt, balance_init_deg, balance_init2_deg, _bal_bump_dv])
+
+	# frame the balancing stack (the default camera was aimed at the ground-level accel tests)
+	var cam := $Camera3D
+	cam.current = true
+	cam.global_position = Vector3(0.0, balance_alt + 0.6, 3.5)
+	cam.look_at(Vector3(0.0, balance_alt + 0.6, 0.0), Vector3.UP)
+
+	# live strip-charts (same accel_graph widget as balance2_test), stacked at the bottom, full width:
+	# TOP = commanded a_cmd vs the REAL realised lateral accel (full loop, not the idealized lag);
+	# BOTTOM = the two link angles. Fed each tick from _bal_record.
+	var gscript = load("res://accel_graph.gd")
+	bal_graph_u = gscript.new()
+	bal_graph_ang = gscript.new()
+	# TOP of screen (the HUD draws a full-width panel across the bottom 300 px -- keep clear of it,
+	# and its Position chart then stays visible for watching the fore/aft axis).
+	for gg in [bal_graph_u, bal_graph_ang]:
+		gg.anchor_left = 0.0; gg.anchor_top = 0.0; gg.anchor_right = 1.0; gg.anchor_bottom = 0.0
+		gg.offset_left = 10.0; gg.offset_right = -10.0
+		$CanvasLayer.add_child(gg)
+		gg.setup(2.0)
+	bal_graph_u.offset_top = 8.0;     bal_graph_u.offset_bottom = 150.0     # accel graph (top)
+	bal_graph_ang.offset_top = 158.0; bal_graph_ang.offset_bottom = 300.0   # angle graph (below it)
+	bal_graph_u.title = "single input a_x [m/s^2]  (a_cmd vs REAL ModeAccel realised)"
+	bal_graph_ang.title = "link angles [deg]"
+	bal_graph_ang.label1 = "link1 theta (0.7 m)"
+	bal_graph_ang.label2 = "link2 theta (0.6 m)"
+
+	# colour the links so they read clearly at a glance: link1 = red, link2 = blue
+	_bal_colour_link(arm_bodies[0], Color(0.90, 0.20, 0.20))
+	if n_arms >= 2:
+		_bal_colour_link(arm_bodies[1], Color(0.25, 0.50, 1.00))
+
+
+# ---- SWINGUP: portable C++ SwingUp on the REAL ModeAccel. Arm(s) start HANGING; the controller pumps up
+# (lateral + vertical) then gates into ArmBalance. Grades on TRUTH link angle, auto-exits headless.
+func _swingup_setup() -> void:
+	# tunable from env (the real stack loses energy the idealized cart didn't, so k=3 not the idealized k=1).
+	# The double's basin is tiny, so its gate defaults are tighter.
+	# The added realism (hinge friction + bob drag + distributed mass) drains swing energy, so the single arm
+	# needs a stronger energy pump than the idealized k=3 to still reach the top; the double kept margin at 3.
+	var g_k := 3.0 if n_arms >= 2 else 6.0
+	var g_ca := 8.0 if n_arms >= 2 else 20.0
+	var g_cr := 40.0 if n_arms >= 2 else 100.0
+	var g_ks := 1.0
+	var g_kv := 2.0
+	var ev := OS.get_environment("SWINGUP_GAIN");       if ev != "": g_k = float(ev)
+	ev = OS.get_environment("SWINGUP_CATCH_ANG");        if ev != "": g_ca = float(ev)
+	ev = OS.get_environment("SWINGUP_CATCH_RATE");       if ev != "": g_cr = float(ev)
+	ev = OS.get_environment("SWINGUP_KS");               if ev != "": g_ks = float(ev)
+	ev = OS.get_environment("SWINGUP_KV");               if ev != "": g_kv = float(ev)
+	if n_arms >= 2:
+		swingup_ctrl = SwingUp2.new()
+		swingup_ctrl.configure({
+			"L1": 0.7, "L2": 0.6, "g": GRAVITY, "m1": 0.1, "m2": 0.1, "pump_gain": g_k,
+			"a_max_lat": 12.0, "a_max_up": GRAVITY,
+			"k_s": g_ks, "k_v": g_kv, "k_h": 2.0, "k_hv": 4.0,
+			"catch_angle": deg_to_rad(g_ca), "catch_rate": deg_to_rad(g_cr)})
+	else:
+		swingup_ctrl = SwingUp.new()
+		swingup_ctrl.configure({
+			"L": 0.7, "g": GRAVITY, "pump_gain": g_k,
+			"a_max_lat": 12.0, "a_max_up": GRAVITY,
+			"k_s": g_ks, "k_v": g_kv, "k_h": 2.0, "k_hv": 4.0,
+			"catch_angle": deg_to_rad(g_ca), "catch_rate": deg_to_rad(g_cr)})
+	print("[swingup] cfg: arms=%d k=%.1f catch=(%.0fdeg,%.0fdps) centering=(%.1f,%.1f)" % [n_arms, g_k, g_ca, g_cr, g_ks, g_kv])
+
+	# drone to a hover altitude, at rest and level; re-anchor the root hinge there
+	drone.global_position = Vector3(0.0, swingup_alt, 0.0)
+	drone.linear_velocity = Vector3.ZERO
+	drone.angular_velocity = Vector3.ZERO
+	var dxf := drone.global_transform
+	dxf.basis = Basis()
+	drone.global_transform = dxf
+	$Pivot.global_transform = Transform3D(Basis.IDENTITY, drone.global_position)
+
+	# link1 HANGING (bob DOWN) with a small +X lean so the pump has a symmetry to break
+	var th0_0 := deg_to_rad(swingup_init_deg)
+	arm_bodies[0].global_transform = Transform3D(Basis(Vector3(0, 0, 1), th0_0), drone.global_position)
+	arm_bodies[0].linear_velocity = Vector3.ZERO
+	arm_bodies[0].angular_velocity = Vector3.ZERO
+
+	# link2 (double only): hang from link1's tip (0.7 m below)
+	if n_arms >= 2:
+		var tip: Vector3 = arm_bodies[0].global_transform * Vector3(0.0, -0.7, 0.0)
+		arm_bodies[1].global_transform = Transform3D(Basis(Vector3(0, 0, 1), th0_0), tip)
+		arm_bodies[1].linear_velocity = Vector3.ZERO
+		arm_bodies[1].angular_velocity = Vector3.ZERO
+		$Pivot2.global_transform = Transform3D(Basis.IDENTITY, tip)
+
+	print("[swingup] SWINGUP active: %d link(s), alt=%.1f m, init=%.1f deg from hang" % [
+		n_arms, swingup_alt, swingup_init_deg])
+
+	var cam := $Camera3D
+	cam.current = true
+	cam.global_position = Vector3(0.0, swingup_alt, 4.6)
+	cam.look_at(Vector3(0.0, swingup_alt, 0.0), Vector3.UP)
+	_bal_colour_link(arm_bodies[0], Color(0.90, 0.20, 0.20))
+	if n_arms >= 2:
+		_bal_colour_link(arm_bodies[1], Color(0.25, 0.50, 1.00))
+
+	# live strip-charts (only with a display): TOP = commanded lateral accel vs the REAL realised accel
+	# (same as the balance demo -- the orange 'realised' line tracks the blue 'cmd' with the ModeAccel
+	# lag); BOTTOM = the two link angles from up. Fed (decimated) from _swingup_record.
+	if DisplayServer.get_name() != "headless":
+		var gscript = load("res://accel_graph.gd")
+		bal_graph_u = gscript.new()
+		bal_graph_ang = gscript.new()
+		for gg in [bal_graph_u, bal_graph_ang]:
+			gg.anchor_left = 0.0; gg.anchor_top = 0.0; gg.anchor_right = 1.0; gg.anchor_bottom = 0.0
+			gg.offset_left = 10.0; gg.offset_right = -10.0
+			$CanvasLayer.add_child(gg)
+			gg.setup(2.5)
+		bal_graph_u.offset_top = 8.0;     bal_graph_u.offset_bottom = 150.0     # accel graph (top)
+		bal_graph_ang.offset_top = 158.0; bal_graph_ang.offset_bottom = 300.0   # angle graph (below it)
+		bal_graph_u.title = "lateral accel a_lat [m/s^2]  (cmd vs REAL ModeAccel realised)"
+		bal_graph_u.label1 = "a_lat cmd"
+		bal_graph_u.label2 = "a_lat realised"
+		bal_graph_ang.title = "link angles from up [deg]   (0 = both upright)"
+		bal_graph_ang.label1 = "link1 (0.7 m)"
+		bal_graph_ang.label2 = "link2 (0.6 m)"
+
+
+# TRUTH |angle from up| of a link [deg]; 0 = upright. (Same convention as the balance grader.)
+func _link_up_deg(i: int) -> float:
+	var rod: Vector3 = arm_bodies[i].global_transform.basis * Vector3(0, -1, 0)
+	return absf(wrapf(atan2(rod.x, rod.y), -PI, PI)) * 180.0 / PI
+
+
+func _swingup_record(delta: float, balancing: bool) -> void:
+	_su_t += delta
+	var up_deg := _link_up_deg(0)
+	if n_arms >= 2:
+		up_deg = maxf(up_deg, _link_up_deg(1))   # BOTH links must be up (double)
+
+	# feed the live strip-charts, DECIMATED to ~100 Hz (grading above runs every tick; only the graph
+	# push is throttled): a_lat cmd vs the REAL realised lateral accel + TRUTH signed link angles from up.
+	_su_graph_n += 1
+	if bal_graph_u and _su_graph_n % 4 == 0:
+		var rod1: Vector3 = arm_bodies[0].global_transform.basis * Vector3(0, -1, 0)
+		var a1u := atan2(rod1.x, rod1.y) * 180.0 / PI
+		var a2u := 0.0
+		if n_arms >= 2:
+			var rod2: Vector3 = arm_bodies[1].global_transform.basis * Vector3(0, -1, 0)
+			a2u = atan2(rod2.x, rod2.y) * 180.0 / PI
+		bal_graph_u.push_sample(_su_t, _su_lat_cmd, _imu_accel_world.x)
+		bal_graph_ang.push_sample(_su_t, a1u, a2u)
+	if _su_t - _su_dbg >= 1.0:
+		_su_dbg = _su_t
+		print("  [su] t=%4.1f  link_up=%5.1f  th_down=%6.1f  alt=%5.2f  x=%+5.2f vx=%+5.2f  a_lat=%+5.1f a_up=%+5.1f  %s" % [
+			_su_t, up_deg, rad_to_deg(arm_theta[0]), drone.global_position.y,
+			drone.global_position.x, drone.linear_velocity.x, _su_lat_cmd, _su_up_cmd,
+			("BAL" if balancing else "pump")])
+	if balancing and not _su_caught:
+		_su_caught = true
+		_su_catch_t = _su_t
+		print("[swingup] CAUGHT at t=%.2f s (worst link %.1f deg from up)" % [_su_t, up_deg])
+	# release when the post-catch hold has elapsed (or the hard cap, if never caught)
+	var t_release := (_su_catch_t + swingup_hold_time) if _su_caught else SWINGUP_RUN_TIME
+	if _su_caught:
+		_su_max_up_after = maxf(_su_max_up_after, up_deg)
+		# steady-state check: last <=4 s of the hold, but always AFTER the catch transient settles
+		if _su_t >= maxf(_su_catch_t + 0.5, t_release - 4.0):
+			_su_max_up_hold = maxf(_su_max_up_hold, up_deg)
+	if _su_t >= t_release and not _su_done:
+		_su_done = true
+		_su_passed = _su_caught and _su_max_up_hold < 15.0
+		print("[swingup] RESULT caught=%d t_catch=%.2f hold=%.1fs max_after=%.1fdeg hold_max=%.1fdeg => %s" % [
+			int(_su_caught), _su_catch_t, swingup_hold_time, _su_max_up_after, _su_max_up_hold,
+			("PASS" if _su_passed else "FAIL")])
+		print("[swingup] releasing -> arms drop, drone holds hover")
+		_su_released = true
+
+
+# Grade the balance loop on TRUTH arm angle (from up), independent of the sensed signal the controller closed on.
+# Track max/final angle, control effort, saturation; apply an optional mid-run cart-velocity bump; finish at 15 s.
+func _bal_record(delta: float, a_cmd: float) -> void:
+	var rod1: Vector3 = arm_bodies[0].global_transform.basis * Vector3(0, -1, 0)
+	var th1_up := atan2(rod1.x, rod1.y)
+	_bal_max1 = maxf(_bal_max1, absf(th1_up) * 180.0 / PI)
+	var th2_up := 0.0
+	if n_arms >= 2:
+		var rod2: Vector3 = arm_bodies[1].global_transform.basis * Vector3(0, -1, 0)
+		th2_up = atan2(rod2.x, rod2.y)
+		_bal_max2 = maxf(_bal_max2, absf(th2_up) * 180.0 / PI)
+	_bal_sum_cmd2 += a_cmd * a_cmd
+	_bal_n += 1
+	if bal_graph_u:
+		bal_graph_u.push_sample(_bal_t, a_cmd, _imu_accel_world.x)                       # cmd vs REAL realised accel
+		bal_graph_ang.push_sample(_bal_t, th1_up * 180.0 / PI, th2_up * 180.0 / PI)      # link1 / link2 angle
+
+	# mid-run lateral velocity bump (perturbs the pivot), like balance_test's cart bump
+	if not _bal_bumped and _bal_t >= _bal_bump_t and _bal_bump_dv != 0.0:
+		drone.linear_velocity.x += _bal_bump_dv
+		_bal_bumped = true
+
+	if _bal_n % 100 == 0:
+		print("[bal] t=%5.2f th1=%+6.2f th2=%+6.2f  lat=%+5.2f fwd=%+6.2f  alt=%5.2f a_cmd=%+6.2f" % [
+			_bal_t, th1_up * 180.0 / PI, th2_up * 180.0 / PI, drone.global_position.x,
+			drone.global_position.z, drone.global_position.y, a_cmd])
+
+	_bal_t += delta
+	if _bal_t >= BAL_RUN_TIME and not _bal_done:
+		_bal_finish(th1_up, th2_up)
+
+
+func _bal_finish(th1_up: float, th2_up: float) -> void:
+	_bal_done = true
+	var f1 := absf(th1_up) * 180.0 / PI
+	var f2 := absf(th2_up) * 180.0 / PI
+	var rms := sqrt(_bal_sum_cmd2 / float(max(1, _bal_n)))
+	var passed := _bal_max1 < 15.0 and f1 < 5.0
+	if n_arms >= 2:
+		passed = passed and _bal_max2 < 15.0 and f2 < 5.0
+	print("RESULT_BAL arms=%d noise=%d ff=%d | link1 max=%.2f final=%.3f | link2 max=%.2f final=%.3f | rms_u=%.2f sat=%d alt=%.2f => %s" % [
+		n_arms, int(sensor_noise_enabled), int(reaction_ff_on), _bal_max1, f1, _bal_max2, f2, rms,
+		int(_bal_sat), drone.global_position.y, ("PASS" if passed else "FAIL")])
+	# headless: a failed balance is done; a passing one goes on to prove the release-and-hover below.
+	if DisplayServer.get_name() == "headless" and not passed:
+		get_tree().quit(2)
+		return
+	_bal_released = true    # balance OFF -> arms drop freely; _service_native now just holds a hover
+	print("[bal] t=%.0fs: balance released -> arms dropping, holding hover" % BAL_RUN_TIME)
+
+
+# Colour a link so the two read clearly at a glance: tint its rod + add a visible bob sphere.
+func _bal_colour_link(arm: Node3D, col: Color) -> void:
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = col
+	var rod := arm.get_node_or_null("Rod")
+	if rod:
+		rod.material_override = mat
+	var bob := arm.get_node_or_null("Bob")
+	if bob:
+		var mi := MeshInstance3D.new()
+		var sph := SphereMesh.new()
+		sph.radius = 0.05
+		sph.height = 0.10
+		mi.mesh = sph
+		mi.material_override = mat
+		bob.add_child(mi)
 
 
 # Sample each active arm's angle (from straight-down, + toward +lateral/+X) and angular rate, and pack
@@ -961,7 +1536,7 @@ func _react_validate(a_d: Vector3, delta: float) -> void:
 	var gx := -a_d.x
 	var gy := -(g + a_d.y)
 	var M := m1 + m2
-	var L1 := 0.6
+	var L1 := 0.7
 	var L2 := 0.6
 	var th1 := float(arm_theta[0])
 	var w1 := float(arm_theta_dot[0])
