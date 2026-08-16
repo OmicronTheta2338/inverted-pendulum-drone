@@ -1,4 +1,4 @@
-[gd_scene load_steps=6 format=3 uid="uid://b5vradiwrclfe"]
+[gd_scene format=3 uid="uid://b5vradiwrclfe"]
 
 [ext_resource type="Script" uid="uid://cqo6qlra41s3t" path="res://main.gd" id="1_0xm2m"]
 [ext_resource type="PackedScene" uid="uid://do5ahw0e1qgac" path="res://Assembly 1.gltf" id="1_ig7tw"]
@@ -7,6 +7,11 @@
 [sub_resource type="SphereShape3D" id="SphereShape3D_bob"]
 radius = 0.02
 
+[sub_resource type="CylinderMesh" id="CylinderMesh_rod1"]
+top_radius = 0.008
+bottom_radius = 0.008
+height = 0.7
+
 [sub_resource type="CylinderMesh" id="CylinderMesh_rod"]
 top_radius = 0.008
 bottom_radius = 0.008
@@ -14,57 +19,78 @@ height = 0.6
 
 [node name="Main" type="Node3D" unique_id=44096971]
 script = ExtResource("1_0xm2m")
+use_ardupilot = null
+use_native = null
+drive_from_pwm = null
+lateral_step_test = null
+enable_pendulum = null
+pendulum_test = null
+sensor_noise_enabled = true
+sensor_pos_drift = null
+sensor_seed = null
+sig_gyro_dps = null
+sig_accel = null
+sig_att_deg = null
+sig_vel = null
+sig_pos = null
+sig_theta0_deg = null
+sig_theta1_deg = null
+enc_lsb_deg = null
+sig_thetadot0_dps = null
+sig_thetadot1_dps = null
+pos_drift_rate = null
+lat_imu_ms = null
+lat_ekf_att_ms = null
+lat_ekf_vel_ms = null
+lat_ekf_pos_ms = null
+lat_arm_ms = null
+lat_arm_ang_imu_ms = null
 
 [node name="Drone" type="RigidBody3D" parent="." unique_id=1629213624]
-mass = 1.0
 center_of_mass_mode = 1
 inertia = Vector3(0.01616, 0.04272, 0.02674)
 
 [node name="Root" parent="Drone" unique_id=1782088897 instance=ExtResource("1_ig7tw")]
 
-[node name="Arm" type="RigidBody3D" parent="."]
+[node name="Arm" type="RigidBody3D" parent="." unique_id=157166134]
+collision_layer = 0
+collision_mask = 0
 mass = 0.1
 can_sleep = false
 linear_damp_mode = 1
-linear_damp = 0.0
 angular_damp_mode = 1
-angular_damp = 0.0
-collision_layer = 0
-collision_mask = 0
 
-[node name="Bob" type="CollisionShape3D" parent="Arm"]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.6, 0)
+[node name="Bob" type="CollisionShape3D" parent="Arm" unique_id=186986358]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.7, 0)
 shape = SubResource("SphereShape3D_bob")
 
-[node name="Rod" type="MeshInstance3D" parent="Arm"]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.3, 0)
-mesh = SubResource("CylinderMesh_rod")
+[node name="Rod" type="MeshInstance3D" parent="Arm" unique_id=2018275975]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.35, 0)
+mesh = SubResource("CylinderMesh_rod1")
 
-[node name="Pivot" type="HingeJoint3D" parent="."]
+[node name="Pivot" type="HingeJoint3D" parent="." unique_id=87909139]
 node_a = NodePath("../Drone")
 node_b = NodePath("../Arm")
 
-[node name="Arm2" type="RigidBody3D" parent="."]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.6, 0)
+[node name="Arm2" type="RigidBody3D" parent="." unique_id=2022673095]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.7, 0)
+collision_layer = 0
+collision_mask = 0
 mass = 0.1
 can_sleep = false
 linear_damp_mode = 1
-linear_damp = 0.0
 angular_damp_mode = 1
-angular_damp = 0.0
-collision_layer = 0
-collision_mask = 0
 
-[node name="Bob" type="CollisionShape3D" parent="Arm2"]
+[node name="Bob" type="CollisionShape3D" parent="Arm2" unique_id=621112900]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.6, 0)
 shape = SubResource("SphereShape3D_bob")
 
-[node name="Rod" type="MeshInstance3D" parent="Arm2"]
+[node name="Rod" type="MeshInstance3D" parent="Arm2" unique_id=2068303050]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.3, 0)
 mesh = SubResource("CylinderMesh_rod")
 
-[node name="Pivot2" type="HingeJoint3D" parent="."]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.6, 0)
+[node name="Pivot2" type="HingeJoint3D" parent="." unique_id=580698163]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.7, 0)
 node_a = NodePath("../Arm")
 node_b = NodePath("../Arm2")
 
