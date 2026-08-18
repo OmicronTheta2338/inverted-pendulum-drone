@@ -12,13 +12,18 @@ config_version=5
 
 config/name="sim_v1"
 run/main_scene="uid://b5vradiwrclfe"
-config/features=PackedStringArray("4.6", "Forward Plus")
+config/features=PackedStringArray("4.7", "Forward Plus")
 run/max_fps=250
 config/icon="res://icon.svg"
 
 [display]
 
+window/size/mode=2
 window/vsync/vsync_mode=0
+
+[editor]
+
+movie_writer/movie_file="/home/omicrontheta/03_Projects/inverted-pendulum-drone/sim-v-1/.ogv"
 
 [physics]
 
