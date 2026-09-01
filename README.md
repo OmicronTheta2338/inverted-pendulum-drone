@@ -8,9 +8,10 @@ has not been built yet.
 
 ## Demonstration
 
-[![Watch the inverted-pendulum drone demonstration](assets/drone-demo-preview.png)](assets/drone-demo.mp4?raw=1)
+![Inverted-pendulum drone demonstration](assets/drone-demo-preview.gif)
 
-**[▶ Watch the 18-second demonstration in full resolution](assets/drone-demo.mp4?raw=1)**
+*The complete 18-second demonstration plays above. For maximum detail,
+[download the full-resolution H.264 video](https://github.com/OmicronTheta2338/inverted-pendulum-drone/raw/refs/heads/main/assets/drone-demo.mp4).*
 
 One continuous run shows the double-pendulum swing-up and catch, a stable upright hold, and the
 vehicle pre-emptively opposing the hinge reaction as the released arms fall.
