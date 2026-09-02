@@ -19,3 +19,7 @@ claude --resume*
 # local AI-assistant tooling config (keep out of the repo)
 .claude/
 CLAUDE.md
+
+# Local MAVLink telemetry logs
+/mav.tlog
+/mav.tlog.raw
