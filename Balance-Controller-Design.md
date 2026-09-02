@@ -379,3 +379,33 @@ with the margin characterised. The double inverted pendulum (serial links 0.7/0.
 one input, `balance2_test.tscn` + `ArmBalance2`) balances upright for 15 s under the
 same noise + latency (16/16 seeds, settles to <0.4°); its tighter latency margin
 (~25 ms, set by the +7.2 rad/s pole) is quantified in §9.
+
+## Onboard double-arm smoothing experiment (2026-10-26)
+
+The current noisy, delayed full drone plant produces alternating acceleration rail
+hits with the original point-mass LQR gains. In `main.gd`'s `BALANCE_ONBOARD=1`,
+the double-arm gains now default to 0.5 times `BAL_GAINS2`. The portable LQR,
+single-arm controller, and swing-up/catch tuning are unchanged. Override with
+`BALANCE_GAIN_SCALE=1` for the original behavior, or another scalar to experiment.
+The acceleration limit remains 12 m/s², retaining catch authority.
+
+A 20-second noisy run (seed 1, initial angles 4°/4°) gave:
+
+| Setting | RMS lateral command (m/s²) | RMS command jerk after 5 s (m/s³) | Peak arm 1 / 2 (degrees) | Saturated | Result |
+| --- | --- | --- | --- | --- | --- |
+| Original gains | 10.41 | 463.492 | 8.12 / 4.00 | yes | PASS |
+| Half gains | 1.68 | 267.478 | 5.95 / 4.00 | no | PASS |
+
+Seeds 2, 3, and 4 also passed with a 0.3 m/s lateral velocity bump (RMS command
+2.02, 1.98, and 1.98 m/s²). Seed 4 used the final default configuration. These are limited simulation checks, not a characterized
+capture envelope. The `BALANCE_SMOOTHNESS` log reports per-tick command jerk;
+it does not measure physical motor or airframe jerk.
+
+Command low-pass experiments at 10 Hz after clipping and 30 Hz before clipping
+lost balance; they were removed. Extra lag is costly in this loop. A simple
+angle extrapolation did not improve command roughness and was also removed.
+
+For the subsequent lift-assisted catch experiment, downward pivot acceleration
+reduces effective gravity; near free fall it approaches zero. This needs a
+vertical-aware dynamics model and altitude/vertical-speed recovery constraints.
+The present change does not modulate lift for pendulum balance.
