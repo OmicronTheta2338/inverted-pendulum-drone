@@ -82,6 +82,12 @@ claims.
 
 ## Current status
 
+**Next hardware milestone:** fly the base drone without the pendulum. Follow the
+[base-drone flight checklist](Base-Drone-Flight-Checklist.md), with flight software preparation
+as the immediate priority.
+The [firmware build and flashing guide](firmware/README.md) provides the pinned ArduPilot
+ALT_HOLD build with the embedded eight-motor mixer for props-off commissioning.
+
 The acceleration loop, reaction-force compensation, single- and double-pendulum balance, and
 double swing-up all pass in simulation under the noise and latency model. A triple pendulum also
 balances in an isolated stretch-goal sandbox. The airframe currently exists as rough parametric
@@ -148,6 +154,39 @@ USE_NATIVE=1 NUM_ARMS=2 SWINGUP=1 USE_SENSOR_NOISE=1 SENSOR_SEED=1 \
 cd native/tests && g++ -O2 -std=c++17 -I../src \
     test_plant_main.cpp ../src/arm_balance_controller.cpp -o test_plant && ./test_plant
 ```
+
+Native simulations enable the sensor model by default (`USE_SENSOR_NOISE=0` selects
+an ideal-truth baseline). Position and velocity initialize from the starting state,
+then integrate the same noisy, vibrating earth-frame IMU specific force used by
+the controller, with NED gravity compensation. Their configured channel latencies
+apply to these integrated estimates. There is no ongoing truth correction or
+external position aiding, so IMU errors accumulate into navigation drift. The old
+independent position/velocity noise and `SENSOR_POS_DRIFT` switch are removed.
+This is an IMU dead-reckoning model, not a complete EKF: attitude remains a
+separate simplified noisy-truth model, and accelerometer bias is not yet modeled.
+The SITL path continues to use ArduPilot's own sensor/estimator pipeline.
+
+In the native scenes, arm 1 now uses a planar two-IMU complementary observer.
+Local arm accelerometer measurements come from the world motion of a point on
+the rod, including pivot, tangential, and centripetal acceleration. Independent
+accelerometer noise and gyro noise/bias random walks enter the observer before
+angle integration and gravity correction. It has no access to true arm angle or
+rate. Strong dynamic loads gate gravity correction; moderate sustained loads
+can still bias it. The default mount is 0.10 m from the proximal pivot
+(`arm_imu_distance`); set this and `sig_arm_accel`, `sig_arm_gyro_dps`, and
+`arm_observer_tau` from the actual hardware. Startup assumes stationary sensors
+for the first two samples while position-difference history fills. Differencing
+adds about one physics tick of acceleration lag. This remains a planar observer,
+not a calibrated full-3D hardware estimator; arm vibration transfer and thermal
+accelerometer bias are not modeled. Downstream joint rates now differentiate
+noisy, quantized encoder readings with `encoder_rate_tau` filtering.
+
+Arm sensing regressions:
+`godot --headless --path sim-v-1 --script res://tests/test_arm_imu.gd`.
+
+
+Run the navigation regression checks with:
+`godot --headless --path sim-v-1 --script res://tests/test_sensor_navigation.gd`.
 
 The interactive scenes (`res://balance2_test.tscn`, `res://swingup2_test.tscn`) draw live
 accel and angle strip-charts. Env knobs and the full run matrix live in the design docs.
