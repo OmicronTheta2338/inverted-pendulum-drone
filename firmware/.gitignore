@@ -1,0 +1,13 @@
+/ardupilot/
+/.venv/
+/toolchain/
+/dist/
+/logs/
+
+# Downloaded vendor installers and bundled runtime
+/SetupSTM32CubeProgrammer_linux_64.zip
+/SetupSTM32CubeProgrammer_linux_64/
+
+# Python bytecode
+__pycache__/
+*.pyc
