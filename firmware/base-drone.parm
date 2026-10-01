@@ -1,0 +1,80 @@
+# ArduCopter 4.7.1 ONLY. Props-off commissioning starting point.
+# Load, reboot, read back. Calibration and motor geometry remain hardware tasks.
+FRAME_CLASS 16
+FRAME_TYPE 0
+# Matches supplied zero Betaflight board alignment provisionally; verify attitude after flash.
+AHRS_ORIENTATION 0
+SCR_ENABLE 1
+# Only load the embedded mixer; exclude old SD-card simulation scripts.
+SCR_DIR_DISABLE 2
+# Verified by the disarmed SITL boot check for scripts/base_drone.lua.
+SCR_LD_CHECKSUM 934390
+SCR_RUN_CHECKSUM 934390
+SERVO1_FUNCTION 33
+SERVO2_FUNCTION 34
+SERVO3_FUNCTION 35
+SERVO4_FUNCTION 36
+SERVO5_FUNCTION 37
+SERVO6_FUNCTION 38
+SERVO7_FUNCTION 39
+SERVO8_FUNCTION 40
+MOT_PWM_TYPE 5
+# Explicit outputs 1-8: six-axis Lua init runs after initial motor-mode setup.
+SERVO_BLH_MASK 255
+SERVO_BLH_OTYPE 5
+MOT_PWM_MIN 1000
+MOT_PWM_MAX 2000
+# Laptop MAVLink RC overrides; ignore physical receiver input.
+MAV_GCS_SYSID 255
+RC_OPTIONS 1
+RC_OVERRIDE_TIME 0.5
+RC_FS_TIMEOUT 1
+FS_THR_ENABLE 3
+FS_GCS_ENABLE 5
+FS_GCS_TIMEOUT 2
+FS_OPTIONS 0
+LAND_REPOSITION 0
+FLTMODE_CH 0
+FLTMODE1 2
+FLTMODE2 2
+FLTMODE3 2
+FLTMODE4 2
+FLTMODE5 2
+FLTMODE6 2
+RC1_MIN 1000
+RC1_TRIM 1500
+RC1_MAX 2000
+RC2_MIN 1000
+RC2_TRIM 1500
+RC2_MAX 2000
+RC3_MIN 1000
+RC3_TRIM 1500
+RC3_MAX 2000
+RC4_MIN 1000
+RC4_TRIM 1500
+RC4_MAX 2000
+RC1_DZ 30
+RC2_DZ 30
+RC3_DZ 30
+RC4_DZ 30
+# 4.7 uses metres/seconds and degrees for these parameters.
+ATC_ANGLE_MAX 10
+PILOT_SPD_UP 0.5
+PILOT_SPD_DN 0.3
+PILOT_ACC_Z 1
+# UART1: XIAO DroneBridge, MAVLink2 115200 baud.
+SERIAL1_PROTOCOL 2
+SERIAL1_BAUD 115
+# Voltage-only commissioning: Hall sensor removed; ESC current inputs not yet verified.
+BATT_MONITOR 3
+# Nominal board value only; prior hardware voltage discrepancy must be resolved.
+BATT_VOLT_MULT 11
+BATT2_MONITOR 0
+# Both owned packs initially operated as ordinary 6S LiPo.
+BATT_LOW_VOLT 21.6
+BATT_CRT_VOLT 21
+BATT_FS_LOW_ACT 1
+BATT_FS_CRT_ACT 1
+LOG_DISARMED 1
+ARMING_SKIPCHK 0
+LAND_SPD_MS 0.3
