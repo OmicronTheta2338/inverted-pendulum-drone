@@ -1,0 +1,184 @@
+{
+  "mass_kg_reported": 1.75,
+  "mass_scope": "Reported assembled drone; whether battery and pendulum included not yet specified",
+  "axes": "Body FRD: x forward/top of image, y right, z down",
+  "position_source": "User-reported rectangles centred on geometric centre: lift 740 x 453 mm; lateral fore/aft span 255 mm. CoM approximately 10 mm forward. Lift hubs assumed 42 mm above CoM; lateral axes approximately level with CoM.",
+  "torque_per_thrust_m_assumed": 0.01,
+  "fc_mounting_orientation": "Betaflight model front confirmed towards image top; align_board_roll/pitch/yaw all zero in supplied dump. ArduPilot attitude verification pending.",
+  "motors": [
+    {
+      "number": 1,
+      "position": "front left lift",
+      "r_frd_m": [
+        0.36,
+        -0.2265,
+        -0.042
+      ],
+      "thrust_unit_frd": [
+        0,
+        0,
+        -1
+      ],
+      "shaft_outward_unit_frd": [
+        0,
+        0,
+        -1
+      ],
+      "rotation_viewed_from_shaft_end": "CCW"
+    },
+    {
+      "number": 2,
+      "position": "front left lateral",
+      "r_frd_m": [
+        0.11750000000000001,
+        null,
+        0
+      ],
+      "thrust_unit_frd": [
+        0,
+        -1,
+        0
+      ],
+      "shaft_outward_unit_frd": [
+        0,
+        -1,
+        0
+      ],
+      "rotation_viewed_from_shaft_end": "CCW"
+    },
+    {
+      "number": 3,
+      "position": "front right lift",
+      "r_frd_m": [
+        0.36,
+        0.2265,
+        -0.042
+      ],
+      "thrust_unit_frd": [
+        0,
+        0,
+        -1
+      ],
+      "shaft_outward_unit_frd": [
+        0,
+        0,
+        -1
+      ],
+      "rotation_viewed_from_shaft_end": "CW"
+    },
+    {
+      "number": 4,
+      "position": "front right lateral",
+      "r_frd_m": [
+        0.11750000000000001,
+        null,
+        0
+      ],
+      "thrust_unit_frd": [
+        0,
+        1,
+        0
+      ],
+      "shaft_outward_unit_frd": [
+        0,
+        1,
+        0
+      ],
+      "rotation_viewed_from_shaft_end": "CW"
+    },
+    {
+      "number": 5,
+      "position": "rear right lift",
+      "r_frd_m": [
+        -0.38,
+        0.2265,
+        -0.042
+      ],
+      "thrust_unit_frd": [
+        0,
+        0,
+        -1
+      ],
+      "shaft_outward_unit_frd": [
+        0,
+        0,
+        -1
+      ],
+      "rotation_viewed_from_shaft_end": "CCW"
+    },
+    {
+      "number": 6,
+      "position": "rear right lateral",
+      "r_frd_m": [
+        -0.1375,
+        null,
+        0
+      ],
+      "thrust_unit_frd": [
+        0,
+        1,
+        0
+      ],
+      "shaft_outward_unit_frd": [
+        0,
+        1,
+        0
+      ],
+      "rotation_viewed_from_shaft_end": "CCW"
+    },
+    {
+      "number": 7,
+      "position": "rear left lift",
+      "r_frd_m": [
+        -0.38,
+        -0.2265,
+        -0.042
+      ],
+      "thrust_unit_frd": [
+        0,
+        0,
+        -1
+      ],
+      "shaft_outward_unit_frd": [
+        0,
+        0,
+        -1
+      ],
+      "rotation_viewed_from_shaft_end": "CW"
+    },
+    {
+      "number": 8,
+      "position": "rear left lateral",
+      "r_frd_m": [
+        -0.1375,
+        null,
+        0
+      ],
+      "thrust_unit_frd": [
+        0,
+        -1,
+        0
+      ],
+      "shaft_outward_unit_frd": [
+        0,
+        -1,
+        0
+      ],
+      "rotation_viewed_from_shaft_end": "CW"
+    }
+  ],
+  "shaft_orientation_source": "Outward shaft ends inferred from supplied CAD; check on assembled hardware",
+  "com_from_geometric_center_frd_m": [
+    0.01,
+    0,
+    0
+  ],
+  "lateral_width_m": null,
+  "geometry_uncertainties": [
+    "CoM and vertical offsets are approximate",
+    "42 mm interpreted as lift hubs above CoM",
+    "Lateral width not supplied; irrelevant to wrench for purely lateral thrust",
+    "Mass scope (battery/pendulum fitted) not specified",
+    "Reaction torque/thrust coefficient remains assumed"
+  ]
+}

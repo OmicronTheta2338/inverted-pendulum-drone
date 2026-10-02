@@ -1,0 +1,68 @@
+diff --git a/libraries/AP_Motors/AP_MotorsMatrix_6DoF_Scripting.cpp b/libraries/AP_Motors/AP_MotorsMatrix_6DoF_Scripting.cpp
+index b27714f..f8d73ad 100644
+--- a/libraries/AP_Motors/AP_MotorsMatrix_6DoF_Scripting.cpp
++++ b/libraries/AP_Motors/AP_MotorsMatrix_6DoF_Scripting.cpp
+@@ -111,6 +111,14 @@ void AP_MotorsMatrix_6DoF_Scripting::output_armed_stabilizing()
+         limit.throttle_upper = true;
+     }
+ 
++    // This airframe uses one-way collective lift motors and opposing lateral
++    // motors. Keep signed lateral requests: their negative half selects the
++    // opposite motor. Collective lift motors cannot provide negative thrust.
++    float minimum_thrust[AP_MOTORS_MAX_NUM_MOTORS];
++    for (i = 0; i < AP_MOTORS_MAX_NUM_MOTORS; i++) {
++        minimum_thrust[i] = (motor_enabled[i] && !_reversible[i] && is_positive(_throttle_factor[i])) ? 0.0f : -1.0f;
++    }
++
+     // rotate the thrust into bodyframe
+     Matrix3f rot;
+     Vector3f thrust_vec;
+@@ -134,7 +142,7 @@ void AP_MotorsMatrix_6DoF_Scripting::output_armed_stabilizing()
+                 // if we hit this the mixer is probably scaled incorrectly
+                 limit.throttle_upper = true;
+             }
+-            _thrust_rpyt_out[i] = constrain_float(_thrust_rpyt_out[i],-1.0f,1.0f);
++            _thrust_rpyt_out[i] = constrain_float(_thrust_rpyt_out[i],minimum_thrust[i],1.0f);
+         }
+     }
+ 
+@@ -153,8 +161,8 @@ void AP_MotorsMatrix_6DoF_Scripting::output_armed_stabilizing()
+             // control input will be limited by motor range
+             if (total_thrust > 1.0f) {
+                 rpy_ratio = MIN(rpy_ratio,(1.0f - _thrust_rpyt_out[i]) / thrust[i]);
+-            } else if (total_thrust < -1.0f) {
+-                rpy_ratio = MIN(rpy_ratio,(-1.0f -_thrust_rpyt_out[i]) / thrust[i]);
++            } else if (total_thrust < minimum_thrust[i]) {
++                rpy_ratio = MIN(rpy_ratio,(minimum_thrust[i] - _thrust_rpyt_out[i]) / thrust[i]);
+             }
+         }
+     }
+@@ -167,7 +175,7 @@ void AP_MotorsMatrix_6DoF_Scripting::output_armed_stabilizing()
+     // scale back rotations evenly so it will all fit
+     for (i = 0; i < AP_MOTORS_MAX_NUM_MOTORS; i++) {
+         if (motor_enabled[i]) {
+-            _thrust_rpyt_out[i] = constrain_float(_thrust_rpyt_out[i] + thrust[i] * rpy_ratio,-1.0f,1.0f);
++            _thrust_rpyt_out[i] = constrain_float(_thrust_rpyt_out[i] + thrust[i] * rpy_ratio,minimum_thrust[i],1.0f);
+         }
+     }
+ 
+@@ -189,8 +197,8 @@ void AP_MotorsMatrix_6DoF_Scripting::output_armed_stabilizing()
+             // control input will be limited by motor range
+             if (total_thrust > 1.0f) {
+                 horz_ratio = MIN(horz_ratio,(1.0f - _thrust_rpyt_out[i]) / thrust[i]);
+-            } else if (total_thrust < -1.0f) {
+-                horz_ratio = MIN(horz_ratio,(-1.0f -_thrust_rpyt_out[i]) / thrust[i]);
++            } else if (total_thrust < minimum_thrust[i]) {
++                horz_ratio = MIN(horz_ratio,(minimum_thrust[i] - _thrust_rpyt_out[i]) / thrust[i]);
+             }
+         }
+     }
+@@ -198,7 +206,7 @@ void AP_MotorsMatrix_6DoF_Scripting::output_armed_stabilizing()
+     // scale back evenly so it will all fit
+     for (i = 0; i < AP_MOTORS_MAX_NUM_MOTORS; i++) {
+         if (motor_enabled[i]) {
+-            _thrust_rpyt_out[i] = constrain_float(_thrust_rpyt_out[i] + thrust[i] * horz_ratio,-1.0f,1.0f);
++            _thrust_rpyt_out[i] = constrain_float(_thrust_rpyt_out[i] + thrust[i] * horz_ratio,minimum_thrust[i],1.0f);
+         }
+     }
+ 
