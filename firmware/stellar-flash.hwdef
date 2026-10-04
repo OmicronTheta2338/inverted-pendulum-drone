@@ -1,0 +1,10 @@
+# This physical FC uses Puya NOR, not the stock target's W25NXX NAND.
+# Keep the onboard LittleFS filesystem and the original SPI pins.
+undef DATAFLASH
+DATAFLASH littlefs:jedec_nor
+# Standard 03h reads are limited to 80 MHz by the Puya datasheet.
+# Use 20 MHz for initial hardware validation.
+undef SPIDEV dataflash
+SPIDEV dataflash SPI4 DEVID3 FLASH_CS MODE3 2*MHZ 20*MHZ
+# Identify this control patch in the FC startup banner.
+define AP_CUSTOM_FIRMWARE_STRING "BaseDrone 4.7.1 liftlimits1"
