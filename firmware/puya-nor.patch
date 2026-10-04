@@ -1,0 +1,20 @@
+diff --git a/libraries/AP_Filesystem/AP_Filesystem_FlashMemory_LittleFS.cpp b/libraries/AP_Filesystem/AP_Filesystem_FlashMemory_LittleFS.cpp
+index a17f73a..3bda2c0 100644
+--- a/libraries/AP_Filesystem/AP_Filesystem_FlashMemory_LittleFS.cpp
++++ b/libraries/AP_Filesystem/AP_Filesystem_FlashMemory_LittleFS.cpp
+@@ -600,6 +600,7 @@ void AP_Filesystem_FlashMemory_LittleFS::mark_dead()
+   Format is manufacturer, memory type, then capacity
+ */
+ #define JEDEC_ID_UNKNOWN               0x000000
++#define JEDEC_ID_PUYA_PY25Q128HA       0x852018
+ #define JEDEC_ID_MACRONIX_MX25L3206E   0xC22016
+ #define JEDEC_ID_MACRONIX_MX25L6406E   0xC22017
+ #define JEDEC_ID_MACRONIX_MX25L25635E  0xC22019
+@@ -786,6 +787,7 @@ uint32_t AP_Filesystem_FlashMemory_LittleFS::find_block_size_and_count() {
+         break;
+ 
+     case JEDEC_ID_MICRON_N25Q128:
++    case JEDEC_ID_PUYA_PY25Q128HA:
+     case JEDEC_ID_WINBOND_W25Q128:
+     case JEDEC_ID_WINBOND_W25Q128_2:
+     case JEDEC_ID_CYPRESS_S25FL128L:
