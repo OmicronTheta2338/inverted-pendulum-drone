@@ -1,5 +1,16 @@
 extends Node3D
 
+const SENSOR_MODEL_SCRIPT := preload("res://simulation/sensor_model.gd")
+const PENDULUM_CHAIN_SCRIPT := preload("res://simulation/pendulum_chain.gd")
+const MOTOR_DYNAMICS_SCRIPT := preload("res://simulation/motor_dynamics.gd")
+const VEHICLE_PLANT_SCRIPT := preload("res://simulation/vehicle_plant.gd")
+const SITL_PROTOCOL_SCRIPT := preload("res://simulation/sitl_protocol.gd")
+const PILOT_INPUT_SCRIPT := preload("res://simulation/pilot_input.gd")
+const AUTO_PROFILE_DRIVER_SCRIPT := preload("res://simulation/auto_profile_driver.gd")
+const ACCELERATION_GRADER_SCRIPT := preload("res://simulation/acceleration_grader.gd")
+const SCENARIO_VISUALS_SCRIPT := preload("res://simulation/scenario_visuals.gd")
+const SWINGUP_RUN_TRACKER_SCRIPT := preload("res://simulation/swingup_run_tracker.gd")
+
 @onready var drone: RigidBody3D = $Drone
 @onready var arm: RigidBody3D = $Arm
 
@@ -8,6 +19,9 @@ extends Node3D
 										 # bridge, no lag). Overrides use_ardupilot when true. See native/.
 @export var drive_from_pwm := true
 @export var lateral_step_test := false   # set true & run scene: measures peak lateral accel + rise time
+@export var response_video_overlay := false  # two top charts for a dedicated arm-drop recording
+@export var graph_window_seconds := 6.0      # slower, easier-to-follow scrolling for recordings
+@export var post_release_reaction_ff := true # comparison runs change only the post-release FF
 @export var enable_pendulum := true      # false -> detach & hide the arm so the bare drone flies unperturbed
 @export var pendulum_test := false       # Phase 7: freeze drone, release arm, measure period/tau vs sqrt(g/L)
 										 # (env PENDULUM_TEST=1 hanging, =2 inverted; no bridge, no motors)
@@ -25,9 +39,6 @@ const HINGE_VISC := 0.002      # A2: hinge VISCOUS friction [N·m·s/rad] (beari
 const HINGE_COUL := 0.003      # A2: hinge COULOMB (dry/stiction) friction [N·m]
 const HINGE_OMEGA_EPS := 0.05  # Coulomb smoothing half-width [rad/s]: below this friction ramps linearly (no chatter)
 const GYRO_KH := 0.0095         # A5: rotor gyro coeff = I_rotor/sqrt(k_T); h_i = KH*sqrt(T_i)*spin*axis [kg·m²/s]
-const C1_ANCHOR_GAIN := 0.15    # C1: residual fraction of the accel gravity-anchor tilt that leaks into arm-1
-								# angle after the 2xIMU differential rejects the common-mode part (small)
-const C1_TAU := 0.3             # C1: anchor low-pass [s] -- the gyro handles faster transients, so they don't leak
 const PEND_L := 0.6           # pivot->bob distance [m]; MUST match the Bob CollisionShape offset in main.tscn
 const PEND_RATE_MAX := 10.0   # rad/s full-scale for the theta-dot bridge channel; MUST match mode_accel.cpp PEND_RATE_MAX
 const T_MAX := 19.3          # F60PROV-LV 1950KV: 1966 g x 9.81 = 19.3 N max per motor
@@ -107,7 +118,15 @@ var _bal_bump_t := 7.5
 var _bal_bump_dv := 0.0                    # mid-run lateral velocity bump [m/s] (0 = none); env BALANCE_BUMP_DV
 var _bal_bumped := false
 var bal_graph_u                            # live strip-chart: a_cmd vs REAL realised lateral accel
-var bal_graph_ang                          # live strip-chart: the two link angles
+var bal_graph_vertical                     # optional response-video chart: vertical command vs realised
+var bal_angle_readout: Label               # compact numeric link-angle display beside the vehicle
+var _overlay_balance_on := false
+var _overlay_vehicle_command := "HOLD POSITION"
+var _overlay_reaction_ff_on := false
+var _recording_auto_exit := false
+var _bal_previous_cmd := 0.0
+var _bal_sum_jerk2 := 0.0
+var _bal_jerk_n := 0
 var _bal_released := false                 # after BAL_RUN_TIME: stop balancing, let the arms drop, hold a hover
 var _bal_post_t := 0.0
 
@@ -119,14 +138,7 @@ var swingup_alt := 10.0                    # hover altitude to swing up at [m]
 var swingup_init_deg := 5.0                # arm start lean from HANGING (breaks symmetric rest); env SWINGUP_INIT_DEG
 var swingup_hold_time := 8.0               # balance this long AFTER the catch, then RELEASE (arms drop); env SWINGUP_HOLD_TIME
 const SWINGUP_RUN_TIME := 18.0             # hard cap if never caught (swing up ~3-4 s + hold, then report)
-var _su_t := 0.0
-var _su_caught := false
-var _su_catch_t := 0.0
-var _su_max_up_after := 0.0                # worst |angle from up| after the catch [deg]
-var _su_max_up_hold := 0.0                 # (same, for the last few seconds) -- steady-state check
-var _su_done := false
-var _su_passed := false                     # graded result (set at release), for the headless quit code
-var _su_released := false                    # after the hold: stop balancing, let the arms drop, hold a hover
+var swingup_run_tracker = SWINGUP_RUN_TRACKER_SCRIPT.new()
 var _su_post_t := 0.0                         # time since release (for the headless quit)
 var _su_dbg := 0.0
 var _su_graph_n := 0                         # tick counter to decimate the live strip-chart pushes
@@ -136,8 +148,7 @@ var _su_up_cmd := 0.0                       # last up_stick*g [m/s^2], for debug
 # ---- headless auto-test (set env AUTOTEST=1): scripted takeoff + accel profile, keyboard ignored.
 # Off by default, so manual flying is unaffected. profile rows: [t_end_s, lat_level(-4..4), vert_level(-3..3)]
 var auto_test := false
-var auto_phase := 0     # 0=takeoff(park), 1=profile, 2=hold(park)
-var auto_t0 := 0.0
+var auto_profile_driver = AUTO_PROFILE_DRIVER_SCRIPT.new()
 # SHORT, SIGN-ALTERNATING holds. The 40ms spec is a STEP-response property, so each command is held
 # just long enough (~0.4s) to see the settle + a brief hold, then reversed. Alternating keeps velocity
 # (hence drag) and altitude bounded near hover -- long same-sign holds built large velocity (drag error)
@@ -203,8 +214,7 @@ var n_arms := 1
 var reaction_ff_on := true       # env REACTION_FF=0 -> arms stay physically attached but the controller is
 								 # told 0 arms, i.e. the reaction-force FF is DISABLED (Packet C: FF-on vs FF-off)
 var arm_bodies: Array[RigidBody3D] = []
-var arm_prev_theta: Array[float] = []
-var arm_has_prev: Array[bool] = []
+var pendulum_chain = PENDULUM_CHAIN_SCRIPT.new()
 # rc_6..rc_10, refreshed every physics tick in _update_pendulum(); default = 0 arms, neutral angle/rate.
 var pend_rc := [1000, 1500, 1500, 1500, 1500]
 # Same per-arm angle/rate as pend_rc but as raw floats (rad, rad/s) for the NATIVE path,
@@ -228,8 +238,9 @@ var _rv_n := 0
 # loop + attitude/mixer, replacing the ArduPilot-over-UDP bridge to remove its round-trip lag.
 var flightstack                       # ApFlightStack (or null when use_native is false)
 const NATIVE_YAW_RATE := 0.7854       # rad/s (~45 deg/s) commanded per full Q/E deflection
+var sensor_model = SENSOR_MODEL_SCRIPT.new()
 
-# ---- representative sensor model (harness-side; behind a switch, OFF by default) ----
+# ---- representative sensor model (harness-side; behind a switch, ON by default) ----
 # On real hardware the flight stack reads a noisy IMU through ArduPilot's INS filtering +
 # EKF3, and the arm angle/rate from a hinge encoder + arm gyro -- NOT the clean Godot truth
 # the native path feeds by default. This models that (noise + measurement latency + EKF lag)
@@ -237,9 +248,13 @@ const NATIVE_YAW_RATE := 0.7854       # rad/s (~45 deg/s) commanded per full Q/E
 # + Balance-Controller-Design 5. Imperfections live HERE (harness), never in the controller.
 # Enable with USE_SENSOR_NOISE=1. The grader (_grade) stays on TRUTH, so it still measures
 # realised-vs-commanded accel honestly while the controller runs on degraded sensors.
-@export var sensor_noise_enabled := false
-@export var sensor_pos_drift := true       # slow IMU-only position dead-reckoning drift (N/E)
+@export var sensor_noise_enabled := true
 @export var sensor_seed := 1
+@export var arm_imu_distance := 0.10 # metres from proximal pivot; set to actual mounting location
+@export var sig_arm_accel := 0.35 # local accelerometer sigma [m/s^2]
+@export var sig_arm_gyro_dps := 0.4 # local gyro sigma [deg/s]
+@export var encoder_rate_tau := 0.02 # differentiated encoder low-pass [s]
+@export var arm_observer_tau := 0.5 # complementary gravity correction [s]
 # per-channel Gaussian 1-sigma (SI). accel folds a broadband vibration RMS into one sigma.
 @export var sig_gyro_dps := 0.05           # gyro noise [deg/s]              (Phase 4)
 @export var sig_accel := 0.25              # accel_ef broadband WHITE [m/s^2] ~5mg sensor + residual; the
@@ -252,46 +267,16 @@ const NATIVE_YAW_RATE := 0.7854       # rad/s (~45 deg/s) commanded per full Q/E
 # true high-frequency ALIASING into the control band would need a multi-rate IMU model (not present here).
 @export var vib_accel := 0.35              # tone amplitude at hover [m/s^2]; env VIB_ACCEL; 0 disables
 @export var vib_f_hover := 90.0            # tone fundamental at hover [Hz]; scales with sqrt(thrust)
-var _vib_phase := 0.0                       # rotor-tone phase accumulator [rad]
 @export var sig_att_deg := 0.1             # EKF attitude noise [deg]
-@export var sig_vel := 0.03                # velocity NED noise [m/s]        (IMU dead-reckoning)
-@export var sig_pos := 0.02                # position NED noise [m]
-# Arm sensing is ASYMMETRIC by hardware (see plan appendix "Packet B - sensor layer"): arm 1
-# (proximal, on the hollow central tube -> no room for a magnetic encoder) senses ANGLE via two
-# IMUs relative to the body IMU. That fusion gives a clean differential-gyro RATE but a
-# drift-bounded, maneuver-coupled, ~EKF-latency ANGLE (gyro integrates -> unbounded drift, so the
-# accel gravity vector must anchor it; that anchor lies under acceleration). Arm 2 (distal) uses a
-# magnetic encoder: clean, low-latency, LSB-quantized angle, but a noisier differentiated rate.
-@export var sig_theta0_deg := 0.15         # arm-1 angle [deg]  (2xIMU fused attitude; NO LSB)
+# Arm 1 uses measured local IMUs; downstream joints use quantized encoders.
 @export var sig_theta1_deg := 0.10         # arm-2 angle [deg]  (magnetic encoder)
 @export var enc_lsb_deg := 0.05            # arm-2 encoder quantization step [deg] (~13-bit)
-@export var sig_thetadot0_dps := 0.4       # arm-1 rate [deg/s] (differential gyro, clean)
-@export var sig_thetadot1_dps := 1.0       # arm-2 rate [deg/s] (differentiated encoder, noisier)
-@export var pos_drift_rate := 0.015        # dead-reckon position random-walk [m/sqrt(s)]. Was 0.05 (Packet-B
-										   # placeholder); at 0.05 the fore/aft hold, having no absolute ref,
-										   # tracked the drift out to ~1 m. Tighter guess -> forward holds <~0.2 m.
-# per-group measurement latency / EKF lag [ms] -> ring-buffer depth (rounded to ticks)
 @export var lat_imu_ms := 2.5              # accel_ef, gyro (raw INS, ~loop rate)
 @export var lat_ekf_att_ms := 8.0          # EKF attitude output-observer lag
 @export var lat_ekf_vel_ms := 20.0         # EKF velocity lag
 @export var lat_ekf_pos_ms := 20.0         # EKF position lag
 @export var lat_arm_ms := 2.5              # arm-2 encoder + differential-gyro read (clean channels)
 @export var lat_arm_ang_imu_ms := 8.0      # arm-1 IMU-FUSED angle only (attitude-observer lag ~EKF att)
-
-var sensor_rng := RandomNumberGenerator.new()
-var _hist: Array = []                      # ring of per-tick sensed (noisy) state snapshots
-var _sb_idx := 0
-var _sb_len := 1
-var _sensor_seeded := false
-var _d_imu := 1                            # per-group delay depths (ticks), set in _sensor_setup
-var _d_att := 3
-var _d_vel := 8
-var _d_pos := 8
-var _d_arm := 1
-var _d_arm_imu := 3                        # arm-1 IMU-fused ANGLE latency (deeper than clean arm chans)
-var _gyro_bias := Vector3.ZERO             # slow gyro bias (random walk)
-var _pos_drift := Vector3.ZERO             # accumulated dead-reckon position drift (NED)
-var _c1_alat_lp := 0.0                     # C1: low-passed lateral specific force (maneuver-coupled arm bias)
 
 # ---- diagnostics (remove once timing is understood) ----
 var _diag_rt := 0           # round-trips (state replies) since last report
@@ -352,6 +337,13 @@ func _ready() -> void:
 	if auto_test:
 		print("[auto] AUTOTEST mode: scripted takeoff + accel profile; keyboard ignored")
 	reaction_ff_on = OS.get_environment("REACTION_FF") != "0"   # only "0" disables; arms stay attached either way
+	var post_ff_env := OS.get_environment("POSTREL_FF")
+	if post_ff_env != "":
+		post_release_reaction_ff = post_ff_env != "0"
+	_recording_auto_exit = OS.get_environment("RECORDING_AUTO_EXIT") == "1"
+	var graph_window_env := OS.get_environment("GRAPH_WINDOW_SECONDS")
+	if graph_window_env != "":
+		graph_window_seconds = maxf(float(graph_window_env), 1.0)
 	if not reaction_ff_on:
 		print("[accel] reaction-force FF DISABLED (REACTION_FF=0): arms swing but are NOT compensated")
 	_rv_on = OS.get_environment("REACT_VALIDATE") == "1"
@@ -389,6 +381,10 @@ func _ready() -> void:
 		var hover_each := MASS * GRAVITY / 4.0
 		motor_thrust = [hover_each, hover_each, hover_each, hover_each, 0, 0, 0, 0]
 		motor_cmd = motor_thrust.duplicate()
+
+	response_video_overlay = response_video_overlay or OS.get_environment("RESPONSE_VIDEO") == "1"
+	if response_video_overlay:
+		print("[graphs] RESPONSE_VIDEO overlay: lateral + vertical command/realised charts")
 
 	if balance_onboard:
 		if n_arms >= 1:
@@ -436,26 +432,12 @@ func _input(event: InputEvent) -> void:
 			# level persists (it does NOT clear on key-up) until another key on that
 			# axis is pressed — so the commanded accel is a held step, and the centre
 			# key (G lateral / V vertical) is the explicit zero command.
-			var accel_keys := [KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H, KEY_J, KEY_K, KEY_L,
-				KEY_Z, KEY_X, KEY_C, KEY_V, KEY_B, KEY_N, KEY_M]
-			match event.keycode:
-				KEY_A: lat_level = -4
-				KEY_S: lat_level = -3
-				KEY_D: lat_level = -2
-				KEY_F: lat_level = -1
-				KEY_G: lat_level = 0
-				KEY_H: lat_level = 1
-				KEY_J: lat_level = 2
-				KEY_K: lat_level = 3
-				KEY_L: lat_level = 4
-				KEY_Z: vert_level = -3
-				KEY_X: vert_level = -2
-				KEY_C: vert_level = -1
-				KEY_V: vert_level = 0
-				KEY_B: vert_level = 1
-				KEY_N: vert_level = 2
-				KEY_M: vert_level = 3
-			if event.keycode in accel_keys and park:
+			var command := PILOT_INPUT_SCRIPT.decode_acceleration_key(event.keycode)
+			if command.x == PILOT_INPUT_SCRIPT.AXIS_LATERAL:
+				lat_level = command.y
+			elif command.x == PILOT_INPUT_SCRIPT.AXIS_VERTICAL:
+				vert_level = command.y
+			if command.x != PILOT_INPUT_SCRIPT.AXIS_NONE and park:
 				park = false
 				print("[park] released -> manual accel control")
 		if get_window().has_focus() == false:
@@ -550,10 +532,11 @@ func _service_sitl(delta: float) -> void:
 			var pkt := udp.get_packet()
 			client_ip = udp.get_packet_ip()
 			client_port = udp.get_packet_port()
-			if pkt.size() >= 40 and pkt.decode_u16(0) == 18458:
+			var pwm := SITL_PROTOCOL_SCRIPT.decode_motor_pwm(pkt)
+			if not pwm.is_empty():
 				if drive_from_pwm:
 					for i in range(8):
-						motor_cmd[i] = _pwm_to_thrust(pkt.decode_u16(8 + i * 2))
+						motor_cmd[i] = _pwm_to_thrust(pwm[i])
 				got_ls = true
 		if got_ls:
 			if drive_from_pwm:
@@ -574,10 +557,11 @@ func _service_sitl(delta: float) -> void:
 		var pkt := udp.get_packet()
 		client_ip = udp.get_packet_ip()
 		client_port = udp.get_packet_port()
-		if pkt.size() >= 40 and pkt.decode_u16(0) == 18458:
+		var pwm := SITL_PROTOCOL_SCRIPT.decode_motor_pwm(pkt)
+		if not pwm.is_empty():
 			if drive_from_pwm:
 				for i in range(8):
-					motor_cmd[i] = _pwm_to_thrust(pkt.decode_u16(8 + i * 2))
+					motor_cmd[i] = _pwm_to_thrust(pwm[i])
 			_diag_rt += 1
 	if drive_from_pwm:
 		_apply_motor_lag(delta)   # slew thrust toward the latest motor_cmd every tick (continuous, real)
@@ -607,7 +591,7 @@ func _service_native(delta: float) -> void:
 	var td0: float = arm_theta_dot[0]
 	var td1: float = arm_theta_dot[1]
 
-	# SENSOR MODEL (harness-side; OFF by default): degrade the state mode-30 reads with
+	# SENSOR MODEL (harness-side; ON by default): degrade the state mode-30 reads with
 	# representative noise + measurement latency + EKF/INS lag, so the controller is validated
 	# on realistic sensing rather than clean truth. The grader (_grade) stays on TRUTH.
 	if sensor_noise_enabled:
@@ -616,7 +600,9 @@ func _service_native(delta: float) -> void:
 			"vel_ned": vel_ned, "pos_ned": pos_ned,
 			"theta0": th0, "theta1": th1, "tdot0": td0, "tdot1": td1,
 		}
-		var s := _sensed_state(truth, delta)
+		truth.merge(pendulum_chain.first_arm_imu(delta, GRAVITY, arm_imu_distance))
+		var total_motor_thrust := MOTOR_DYNAMICS_SCRIPT.total_thrust(motor_thrust)
+		var s := sensor_model.sample(truth, delta, total_motor_thrust)
 		accel_ef = s["accel_ef"]; gyro_frd = s["gyro"]; quat = s["quat"]
 		vel_ned = s["vel_ned"]; pos_ned = s["pos_ned"]
 		th0 = s["theta0"]; th1 = s["theta1"]; td0 = s["tdot0"]; td1 = s["tdot1"]
@@ -626,17 +612,23 @@ func _service_native(delta: float) -> void:
 	# command: BALANCE_ONBOARD -> the balance controller drives lat_stick (closing the pendulum loop on the
 	# REAL accel inner loop); else latched keyboard levels -> normalized sticks; Q/E -> yaw rate; SPACE -> park.
 	# (auto_test drives lat_level/vert_level/park via _auto_drive, exactly as in the bridge path.)
+	# All outer loops use the same navigation estimate as the native stack.
+	# P maps world to NED; convert back without reading the rigid-body truth.
+	var estimated_position := P.inverse() * pos_ned
+	var estimated_velocity := P.inverse() * vel_ned
+
 	var lat_stick := lat_level / 4.0
 	var up_stick := vert_level / 3.0
 	var yaw := 0.0
-	if swingup_onboard and not _su_released:
+	var ff_arms := (n_arms if reaction_ff_on else 0)
+	if swingup_onboard and not swingup_run_tracker.released:
 		# SWINGUP: the portable C++ SwingUp controller drives BOTH sticks. It pumps energy (lateral +
 		# vertical) from hanging, then gates into the ArmBalance LQR once inside the measured basin. th0/td0
-		# are the SENSED arm state (from straight-DOWN); s,v,h,vy are the drone cart state (truth, slow loop).
-		var s_lat := drone.global_position.x
-		var v_lat := drone.linear_velocity.x
-		var h_dev := drone.global_position.y - swingup_alt
-		var vy := drone.linear_velocity.y
+		# are the SENSED arm state (from straight-DOWN); s,v,h,vy are the estimated drone cart state.
+		var s_lat := estimated_position.x
+		var v_lat := estimated_velocity.x
+		var h_dev := estimated_position.y - swingup_alt
+		var vy := estimated_velocity.y
 		var o: Dictionary
 		if n_arms >= 2:   # SwingUp2 also needs link2's sensed angle/rate
 			o = swingup_ctrl.update(th0, td0, th1, td1, s_lat, v_lat, h_dev, vy, delta)
@@ -645,26 +637,42 @@ func _service_native(delta: float) -> void:
 		lat_stick = clampf(float(o["a_lat"]) / 12.0, -1.0, 1.0)   # ACCEL_LAT_CMD_MSS=12
 		up_stick = clampf(float(o["a_up"]) / GRAVITY, -1.0, 1.0)  # a_up in [-g,+g] -> up_stick in [-1,1]
 		_su_lat_cmd = float(o["a_lat"]); _su_up_cmd = float(o["a_up"])
+		_overlay_balance_on = bool(o["balancing"])
+		_overlay_vehicle_command = "BALANCE" if _overlay_balance_on else "SWING UP"
+		_overlay_reaction_ff_on = ff_arms > 0
 		yaw = 0.0
 		park = false
 		_swingup_record(delta, bool(o["balancing"]))
 	elif swingup_onboard:
 		# hold elapsed -> RELEASE: stop driving the arms, let them fall; the drone just holds a hover.
 		# Reaction FF stays on (n_arms passed below) so the dropping arms barely shove the frame.
-		lat_stick = clampf((-1.5 * drone.global_position.x - 3.0 * drone.linear_velocity.x) / 12.0, -1.0, 1.0)
-		up_stick = clampf((2.0 * (swingup_alt - drone.global_position.y) - 2.0 * drone.linear_velocity.y) / GRAVITY, -1.0, 1.0)
+		if not post_release_reaction_ff:
+			ff_arms = 0
+		_overlay_balance_on = false
+		_overlay_vehicle_command = "HOLD POSITION"
+		_overlay_reaction_ff_on = ff_arms > 0
+		lat_stick = clampf((-1.5 * estimated_position.x - 3.0 * estimated_velocity.x) / 12.0, -1.0, 1.0)
+		up_stick = clampf((2.0 * (swingup_alt - estimated_position.y) - 2.0 * estimated_velocity.y) / GRAVITY, -1.0, 1.0)
 		park = false
 		_su_post_t += delta
-		if DisplayServer.get_name() == "headless" and _su_post_t >= 3.0:
+		_su_graph_n += 1
+		if _su_graph_n % 4 == 0:
+			_push_analysis_samples(
+				swingup_run_tracker.elapsed + _su_post_t,
+				lat_stick * 12.0,
+				up_stick * GRAVITY
+			)
+		if (DisplayServer.get_name() == "headless" and _su_post_t >= 3.0) \
+				or (_recording_auto_exit and _su_post_t >= 6.0):
 			print("[swingup] post-release +%.1fs: alt=%.2f lat=%.2f (arms dropped, drone held hover)" % [
 				_su_post_t, drone.global_position.y, drone.global_position.x])
-			get_tree().quit(0 if _su_passed else 2)
+			get_tree().quit(0 if swingup_run_tracker.passed else 2)
 	elif balance_onboard and not _bal_released:
 		# Feed the balance controller the SAME sensed arm state the reaction FF gets, re-expressed in ITS
 		# convention: th0/td0 are sensed from straight-DOWN, so theta_up = wrap(PI - theta_down) and the rate
-		# FLIPS SIGN (theta_dot_up = -theta_dot_down). s,v = drone lateral (world-X) pos/vel (truth, slow loop).
-		var s_lat := drone.global_position.x
-		var v_lat := drone.linear_velocity.x
+		# FLIPS SIGN (theta_dot_up = -theta_dot_down). s,v = drone lateral (world-X) pos/vel from the navigation estimate.
+		var s_lat := estimated_position.x
+		var v_lat := estimated_velocity.x
 		var a_cmd := 0.0
 		if n_arms >= 2:
 			a_cmd = balance_ctrl.update(wrapf(PI - th0, -PI, PI), -td0,
@@ -676,29 +684,42 @@ func _service_native(delta: float) -> void:
 		lat_stick = clampf(a_cmd / 12.0, -1.0, 1.0)   # ACCEL_LAT_CMD_MSS=12: full lateral stick = 12 m/s^2
 		# vertical: gentle altitude-hold PD -> vertical accel command. up_stick=0 alone holds zero ACCEL,
 		# which permits a constant-velocity sink (esp. with the arm weight uncarried when FF is off); a
-		# position/velocity PD holds altitude and decouples "stay airborne" from the reaction FF. (truth alt/vy.)
-		var alt_err := balance_alt - drone.global_position.y
-		up_stick = clampf((2.0 * alt_err - 2.0 * drone.linear_velocity.y) / GRAVITY, -1.0, 1.0)
+		# position/velocity PD holds altitude and decouples "stay airborne" from the reaction FF. (estimated altitude/vertical speed.)
+		var alt_err := balance_alt - estimated_position.y
+		up_stick = clampf((2.0 * alt_err - 2.0 * estimated_velocity.y) / GRAVITY, -1.0, 1.0)
+		_overlay_balance_on = true
+		_overlay_vehicle_command = "BALANCE"
+		_overlay_reaction_ff_on = ff_arms > 0
 		park = false
-		_bal_record(delta, a_cmd)
+		_bal_record(delta, a_cmd, up_stick * GRAVITY)
 	elif balance_onboard:
 		# BAL_RUN_TIME elapsed: balance OFF -> the links drop freely; the drone just holds a hover.
 		# The reaction FF stays on (n_arms passed below), so the falling arms barely shove the frame.
-		lat_stick = clampf((-1.5 * drone.global_position.x - 3.0 * drone.linear_velocity.x) / 12.0, -1.0, 1.0)
-		up_stick = clampf((2.0 * (balance_alt - drone.global_position.y) - 2.0 * drone.linear_velocity.y) / GRAVITY, -1.0, 1.0)
+		if not post_release_reaction_ff:
+			ff_arms = 0
+		_overlay_balance_on = false
+		_overlay_vehicle_command = "HOLD POSITION"
+		_overlay_reaction_ff_on = ff_arms > 0
+		lat_stick = clampf((-1.5 * estimated_position.x - 3.0 * estimated_velocity.x) / 12.0, -1.0, 1.0)
+		up_stick = clampf((2.0 * (balance_alt - estimated_position.y) - 2.0 * estimated_velocity.y) / GRAVITY, -1.0, 1.0)
 		park = false
 		_bal_post_t += delta
-		if DisplayServer.get_name() == "headless" and _bal_post_t >= 3.0:
+		_push_analysis_samples(
+			_bal_t + _bal_post_t,
+			lat_stick * 12.0,
+			up_stick * GRAVITY
+		)
+		if (DisplayServer.get_name() == "headless" and _bal_post_t >= 3.0) \
+				or (_recording_auto_exit and _bal_post_t >= 6.0):
 			print("[bal] post-release hover +%.1fs: alt=%.2f lat=%.2f fwd=%.2f (arms dropped, drone held)" % [
 				_bal_post_t, drone.global_position.y, drone.global_position.x, drone.global_position.z])
 			get_tree().quit(0)
 	else:
-		if Input.is_key_pressed(KEY_E): yaw += 1.0
-		if Input.is_key_pressed(KEY_Q): yaw -= 1.0
+		yaw = float(PILOT_INPUT_SCRIPT.yaw_direction())
 	# reaction_ff_on=false -> tell the controller 0 arms so its reaction FF is skipped, while the physical
 	# arms (built from n_arms) keep swinging -> isolates the FF's effect in the truth-based grader.
 	flightstack.set_command(lat_stick, up_stick, yaw * NATIVE_YAW_RATE, park,
-		(n_arms if reaction_ff_on else 0),
+		ff_arms,
 		Vector3(th0, th1, 0.0), Vector3(td0, td1, 0.0))
 
 	# run the ported mode-30 loop -> 8 motor PWM, then slew the plant exactly like the bridge
@@ -710,130 +731,41 @@ func _service_native(delta: float) -> void:
 
 # ---- sensor model helpers (see the export block up top). Called only on the native path. ----
 func _sensor_setup() -> void:
-	if OS.get_environment("USE_SENSOR_NOISE") == "1":
-		sensor_noise_enabled = true
+	if OS.get_environment("USE_SENSOR_NOISE") != "":
+		sensor_noise_enabled = OS.get_environment("USE_SENSOR_NOISE") != "0"
 	var v := OS.get_environment("SENSOR_SEED");         if v != "": sensor_seed = int(v)
-	if OS.get_environment("SENSOR_POS_DRIFT") == "0":   sensor_pos_drift = false
 	v = OS.get_environment("SENSOR_LAT_EKF_ATT_MS");    if v != "": lat_ekf_att_ms = float(v)
 	v = OS.get_environment("SENSOR_LAT_EKF_VEL_MS");    if v != "": lat_ekf_vel_ms = float(v)
 	v = OS.get_environment("SENSOR_LAT_EKF_POS_MS");    if v != "": lat_ekf_pos_ms = float(v)
 	v = OS.get_environment("SENSOR_LAT_ARM_IMU_MS");    if v != "": lat_arm_ang_imu_ms = float(v)
 	v = OS.get_environment("SENSOR_LAT_ARM_RATE_MS");   if v != "": lat_arm_ms = float(v)
-	sensor_rng.seed = sensor_seed
-
-	# ring-buffer sized to the largest latency; per-group depths in ticks
-	var ticks := float(Engine.physics_ticks_per_second)
-	_d_imu = int(round(lat_imu_ms     / 1000.0 * ticks))
-	_d_att = int(round(lat_ekf_att_ms / 1000.0 * ticks))
-	_d_vel = int(round(lat_ekf_vel_ms / 1000.0 * ticks))
-	_d_pos = int(round(lat_ekf_pos_ms / 1000.0 * ticks))
-	_d_arm = int(round(lat_arm_ms     / 1000.0 * ticks))
-	_d_arm_imu = int(round(lat_arm_ang_imu_ms / 1000.0 * ticks))
-	_sb_len = maxi(maxi(maxi(_d_imu, _d_att), maxi(_d_vel, _d_pos)), maxi(_d_arm, _d_arm_imu)) + 1
-	_hist.resize(_sb_len)
-	_sb_idx = 0
-	_sensor_seeded = false
+	sensor_model.configure({
+		"seed": sensor_seed,
+		"sig_arm_accel": sig_arm_accel,
+		"sig_arm_gyro_dps": sig_arm_gyro_dps,
+		"arm_observer_tau": arm_observer_tau,
+		"encoder_rate_tau": encoder_rate_tau,
+		"sig_gyro_dps": sig_gyro_dps,
+		"sig_accel": sig_accel,
+		"vib_accel": vib_accel,
+		"vib_f_hover": vib_f_hover,
+		"sig_att_deg": sig_att_deg,
+		"sig_relative_angle_deg": sig_theta1_deg,
+		"encoder_lsb_deg": enc_lsb_deg,
+		"lat_imu_ms": lat_imu_ms,
+		"lat_attitude_ms": lat_ekf_att_ms,
+		"lat_velocity_ms": lat_ekf_vel_ms,
+		"lat_position_ms": lat_ekf_pos_ms,
+		"lat_arm_ms": lat_arm_ms,
+		"lat_arm_imu_ms": lat_arm_ang_imu_ms,
+		"mass": MASS,
+		"gravity": GRAVITY,
+		"arm_count": 2,
+	})
 	if sensor_noise_enabled:
-		print("[sensor] model ON seed=%d lat(imu/att/vel/pos/arm/arm_imu ticks)=%d/%d/%d/%d/%d/%d drift=%d" % [
-			sensor_seed, _d_imu, _d_att, _d_vel, _d_pos, _d_arm, _d_arm_imu, int(sensor_pos_drift)])
-
-
-# Add fresh per-channel Gaussian noise (+ gyro bias walk / encoder quantization / dead-reckon
-# drift) to the true state, push the sample into the delay ring, then read each channel back at
-# its own measurement/EKF latency. Returns the sensed (noisy, delayed) snapshot.
-func _sensed_state(truth: Dictionary, dt: float) -> Dictionary:
-	var g := sensor_rng
-	var d2r := deg_to_rad(1.0)
-
-	# gyro: slow bias random walk (0.5 deg/s/sqrt(hr)) + white noise
-	_gyro_bias += Vector3(g.randfn(), g.randfn(), g.randfn()) * (0.5 * d2r / sqrt(3600.0)) * sqrt(dt)
-	var sg := sig_gyro_dps * d2r
-	var gyro_n: Vector3 = truth["gyro"] + _gyro_bias + Vector3(g.randfn(), g.randfn(), g.randfn()) * sg
-
-	# accel_ef: broadband white noise + a coherent rotor-vibration tone (C4).
-	var accel_n: Vector3 = truth["accel_ef"] + Vector3(g.randfn(), g.randfn(), g.randfn()) * sig_accel
-	# rotor tone: throttle-coupled amplitude, sqrt(thrust) frequency (RPM proxy), decorrelated phase/axis.
-	if vib_accel > 0.0:
-		var total_T := 0.0
-		for i in range(8):
-			total_T += motor_thrust[i]
-		var load := clampf(total_T / maxf(MASS * GRAVITY, 1e-3), 0.0, 4.0)   # 1.0 at hover; cap runaway
-		if load > 0.0:
-			_vib_phase = fposmod(_vib_phase + TAU * (vib_f_hover * sqrt(load)) * dt, TAU)
-			var amp := vib_accel * load                                       # imbalance force ∝ thrust
-			accel_n += Vector3(sin(_vib_phase), sin(_vib_phase + 2.094), sin(_vib_phase + 4.189)) * amp
-
-	# attitude: small random body rotation on the quaternion
-	var sa := sig_att_deg * d2r
-	var quat_n: Quaternion = (truth["quat"] as Quaternion) * Quaternion.from_euler(
-		Vector3(g.randfn(), g.randfn(), g.randfn()) * sa)
-
-	# velocity: white noise (IMU dead-reckoning)
-	var vel_n: Vector3 = truth["vel_ned"] + Vector3(g.randfn(), g.randfn(), g.randfn()) * sig_vel
-
-	# position: white noise + optional dead-reckon drift (horizontal N/E; baro holds D)
-	if sensor_pos_drift:
-		_pos_drift += Vector3(g.randfn(), 0.0, g.randfn()) * pos_drift_rate * sqrt(dt)
-	var pos_n: Vector3 = truth["pos_ned"] + _pos_drift + Vector3(g.randfn(), g.randfn(), g.randfn()) * sig_pos
-
-	# arm 1 (proximal): 2xIMU fused -> continuous angle (NO encoder LSB) + clean differential-gyro
-	# rate. NOTE (documented simplification): the maneuver-coupled angle error -- the accel gravity
-	# anchor tilting under the drone's catch acceleration -- is NOT modelled here; only its extra
-	# fusion LATENCY is (read back at _d_arm_imu below). Revisit at hardware / if Packet D is fragile.
-	# C1: maneuver-coupled arm-1 angle bias -- the 2xIMU gravity anchor leans under the drone's lateral accel.
-	# Differential IMUs reject the common-mode part, so only a small low-passed residual leaks (the gyro handles
-	# the fast transient). a_lat = accel_ef.y (= world-X specific force at yaw~0).
-	var a_lat_sf := float((truth["accel_ef"] as Vector3).y)
-	_c1_alat_lp += (a_lat_sf - _c1_alat_lp) * (1.0 - exp(-dt / C1_TAU))
-	var th0_bias := C1_ANCHOR_GAIN * atan2(_c1_alat_lp, GRAVITY)
-	var th0: float = float(truth["theta0"]) + th0_bias + g.randfn() * (sig_theta0_deg * d2r)
-	var td0: float = float(truth["tdot0"]) + g.randfn() * (sig_thetadot0_dps * d2r)
-	# arm 2 (distal): the magnetic encoder sits OVER THE JOINT, so it measures the RELATIVE angle
-	# phi = theta2 - theta1 (known "exactly", to the LSB), NOT theta2 absolute. Link2 carries no
-	# inertial sensor of its own, so its ABSOLUTE angle/rate are reconstructed on read-back (below) as
-	# theta1(IMU) + phi(encoder) -- so link2 correctly INHERITS link1's IMU noise + 8 ms fusion latency,
-	# with only the clean relative encoder on top. (rate: link1 gyro + differentiated encoder.)
-	var lsb := deg_to_rad(enc_lsb_deg)
-	var phi_true: float = float(truth["theta1"]) - float(truth["theta0"])
-	var phi_q: float = (round(phi_true / lsb) * lsb if lsb > 0.0 else phi_true)
-	var phi: float = phi_q + g.randfn() * (sig_theta1_deg * d2r)
-	var phidot: float = (float(truth["tdot1"]) - float(truth["tdot0"])) + g.randfn() * (sig_thetadot1_dps * d2r)
-
-	var snap := {
-		"accel_ef": accel_n, "gyro": gyro_n, "quat": quat_n,
-		"vel_ned": vel_n, "pos_ned": pos_n,
-		"theta0": th0, "phi": phi, "tdot0": td0, "phidot": phidot,
-	}
-	if not _sensor_seeded:
-		for i in range(_sb_len):
-			_hist[i] = snap.duplicate()
-		_sensor_seeded = true
-	_hist[_sb_idx] = snap
-
-	# read each channel at its own latency (ring depth); advance the write index afterward.
-	# arm-1 (link1) absolute: 2xIMU fusion (deep, EKF-att-like latency) + differential gyro rate.
-	var th0r: float = _read_ch("theta0", _d_arm_imu)
-	var td0r: float = _read_ch("tdot0", _d_arm)
-	var out := {
-		"accel_ef": _read_ch("accel_ef", _d_imu),
-		"gyro":     _read_ch("gyro", _d_imu),
-		"quat":     _read_ch("quat", _d_att),
-		"vel_ned":  _read_ch("vel_ned", _d_vel),
-		"pos_ned":  _read_ch("pos_ned", _d_pos),
-		"theta0":   th0r,
-		"tdot0":    td0r,
-		# arm-2 (link2) ABSOLUTE = link1(IMU, 8 ms) + relative encoder(clean, ~loop-rate): link2 inherits
-		# link1's noise + latency (shared th0r sample -> errors are correlated, as on the real vehicle).
-		"theta1":   th0r + _read_ch("phi", _d_arm),
-		"tdot1":    td0r + _read_ch("phidot", _d_arm),
-	}
-	_sb_idx = (_sb_idx + 1) % _sb_len
-	return out
-
-
-func _read_ch(key: String, depth: int):
-	var ri := (_sb_idx - depth + _sb_len) % _sb_len
-	return (_hist[ri] as Dictionary)[key]
+		var delays := sensor_model.latency_summary()
+		print("[sensor] model ON seed=%d lat(imu/att/vel/pos/arm/arm_imu ticks)=%d/%d/%d/%d/%d/%d navigation=IMU-dead-reckoning" % [
+			sensor_seed, delays[0], delays[1], delays[2], delays[3], delays[4], delays[5]])
 
 
 # Print a one-line timing summary once per wall-clock second.
@@ -867,54 +799,29 @@ func _diag_report() -> void:
 # with total thrust, so the achievable thrust for a given PWM is motor_cmd * _sag_factor. The sag reads
 # last tick's realized total (explicit), which avoids a current<->voltage algebraic loop within a tick.
 func _apply_motor_lag(dt: float) -> void:
-	var total_T := 0.0
-	for i in range(8):
-		total_T += motor_thrust[i]
-	var v_ratio := maxf(0.0, 1.0 - batt_sag_k * total_T)   # V/V_nom
-	_sag_factor = maxf(BATT_SAG_FLOOR, v_ratio * v_ratio)  # thrust ∝ V² at fixed throttle
-	for i in range(8):
-		var target := motor_cmd[i] * _sag_factor           # same PWM → less thrust when the pack sags
-		var tau := MOTOR_TAU_UP if target >= motor_thrust[i] else MOTOR_TAU_DOWN
-		var alpha := 1.0 - exp(-dt / tau)
-		motor_thrust[i] += (target - motor_thrust[i]) * alpha
+	_sag_factor = MOTOR_DYNAMICS_SCRIPT.apply_lag_with_battery_sag(
+		motor_thrust,
+		motor_cmd,
+		dt,
+		MOTOR_TAU_UP,
+		MOTOR_TAU_DOWN,
+		batt_sag_k,
+		BATT_SAG_FLOOR
+	)
 
 
 func _pwm_to_thrust(pwm: int) -> float:
-	var x := clampf((float(pwm) - 1000.0) / 1000.0, 0.0, 1.0)
 	# F60PROV-LV 1950KV prop curve: thrust = (1-e)x + e x^2 (e = THRUST_EXPO).
 	# ArduPilot pre-distorts its PWM via MOT_THST_EXPO=e so realized thrust stays
 	# linear in the controller's command — set both to the same e or they fight.
-	return T_MAX * ((1.0 - THRUST_EXPO) * x + THRUST_EXPO * x * x)
+	return MOTOR_DYNAMICS_SCRIPT.pwm_to_thrust(pwm, T_MAX, THRUST_EXPO)
 
 
 func _apply_forces() -> void:
-	var basis := drone.global_transform.basis
-	var v_world := drone.linear_velocity
-	for i in range(8):
-		var T: float = motor_thrust[i]
-		if T == 0.0:
-			continue
-		var axis_w := basis * motor_dir[i]              # world-frame thrust direction of this motor
-		# A4: advance-ratio droop -- unload the prop as the vehicle advances into its own thrust axis.
-		var v_ax := v_world.dot(axis_w)
-		if v_ax > 0.0:
-			T *= maxf(0.0, 1.0 - adv_ratio_k * v_ax)
-		drone.apply_force(axis_w * T, basis * motor_pos[i])
-		drone.apply_torque(axis_w * (motor_spin[i] * K_M * T))
-	# A6: quadratic aerodynamic body drag, F = -k|v|v (replaces the linear linear_damp placeholder).
-	# At the CoM so it adds no spurious moment; the dv/dt IMU sees it, so the controller feels real drag.
-	var v_body := drone.linear_velocity
-	var sp := v_body.length()
-	if sp > 1e-3:
-		drone.apply_central_force(-BODY_DRAG_K * sp * v_body)
-	# A5: rotor gyroscopic reaction. Each rotor carries angular momentum h_i along its (body) thrust axis;
-	# under body rate Ω the rotors react on the frame with τ = -Ω × ΣH_i. Counter-rotating pairs cancel ΣH
-	# at balanced thrust -> this only appears under the differential thrust of a real maneuver.
-	var H := Vector3.ZERO
-	for i in range(8):
-		if motor_thrust[i] > 0.0:
-			H += basis * (motor_dir[i] * (GYRO_KH * sqrt(motor_thrust[i]) * motor_spin[i]))
-	drone.apply_torque(-drone.angular_velocity.cross(H))
+	VEHICLE_PLANT_SCRIPT.apply_motor_forces(
+		drone, motor_pos, motor_dir, motor_spin, motor_thrust,
+		K_M, adv_ratio_k, BODY_DRAG_K, GYRO_KH
+	)
 
 
 # A2 + A3: realistic pendulum dissipation, so the arms DECAY like a real rig instead of swinging forever.
@@ -922,39 +829,13 @@ func _apply_forces() -> void:
 # RELATIVE swing rate about the hinge axis. The controllers do NOT model this (a real hinge's friction is
 # unmodelled too), so it also exercises disturbance rejection. Hinge axis is body-Z of the parent link.
 func _apply_arm_damping() -> void:
-	if n_arms <= 0 or drone.global_position.y <= 0.0:
-		return
-	for a in arm_bodies:
-		var v: Vector3 = a.linear_velocity
-		var sp := v.length()
-		if sp > 1e-3:
-			a.apply_central_force(-ARM_DRAG_K * sp * v)               # A3: bob air drag
-	_hinge_friction(drone, arm_bodies[0], drone.global_transform.basis * Vector3(0, 0, 1))   # root hinge
-	if n_arms >= 2:
-		_hinge_friction(arm_bodies[0], arm_bodies[1], arm_bodies[0].global_transform.basis * Vector3(0, 0, 1))
-
-
-# Equal-and-opposite friction torque about a hinge axis: viscous (∝ rate) + Coulomb (∝ sign, ramped near 0).
-func _hinge_friction(a: RigidBody3D, b: RigidBody3D, axis: Vector3) -> void:
-	var w_rel := (b.angular_velocity - a.angular_velocity).dot(axis)   # relative swing rate about the hinge
-	var coul := clampf(w_rel / HINGE_OMEGA_EPS, -1.0, 1.0)             # smoothed sign(): no chatter through 0
-	var tvec := axis * (-(HINGE_VISC * w_rel + HINGE_COUL * coul))
-	b.apply_torque(tvec)
-	a.apply_torque(-tvec)
+	pendulum_chain.apply_damping(
+		drone, ARM_DRAG_K, HINGE_VISC, HINGE_COUL, HINGE_OMEGA_EPS
+	)
 
 
 func _ground_clamp() -> void:
-	on_ground = drone.global_position.y <= 0.0
-	if on_ground:
-		var v := drone.linear_velocity
-		if v.y < 0.0:
-			v.y = 0.0
-		v.x *= 0.8   # ground friction — a landed drone shouldn't skate on a frictionless floor
-		v.z *= 0.8
-		drone.linear_velocity = v
-		var t := drone.global_transform
-		t.origin.y = 0.0
-		drone.global_transform = t
+	on_ground = VEHICLE_PLANT_SCRIPT.clamp_to_ground(drone)
 
 
 # Map the latched ACCEL-mode levels into RC PWM (injected into the bridge packet
@@ -979,9 +860,7 @@ func _update_rc() -> void:
 	else:
 		rc[2] = RC_CENTER + int(round(vert_level / 3.0 * 500.0))  # level -3..+3 -> 1000..2000
 
-	var yaw := 0
-	if Input.is_key_pressed(KEY_E): yaw += 1   # yaw right (CW)
-	if Input.is_key_pressed(KEY_Q): yaw -= 1   # yaw left (CCW)
+	var yaw := PILOT_INPUT_SCRIPT.yaw_direction()
 	rc[3] = RC_CENTER + yaw * RC_DEFLECT
 
 
@@ -1004,33 +883,18 @@ func _send_state() -> void:
 	var R := P * basis * P.inverse()
 	var q := R.get_rotation_quaternion()
 
-	var state := {
-		"timestamp": sim_time,
-		# Async (no real-time handshake). With lockstep, AP blocks until Godot's
-		# reply each frame; on Godot's single main thread that round-trip can't
-		# reliably land inside AP's 5 ms budget, so AP's loop sat at ~178 Hz (just
-		# under the 90%-of-200 arming gate) — or, if we spin to force it, input
-		# starves. no_lockstep frees AP to run its loop at SIM_RATE_HZ and read
-		# our state as it arrives. timestamp is still honoured (time-sync stays
-		# on), so physics stays accurate; we only give up deterministic replay.
-		"no_lockstep": not lockstep,
-		"imu": {
-			"gyro": [gyro_frd.x, gyro_frd.y, gyro_frd.z],
-			"accel_body": [accel_frd.x, accel_frd.y, accel_frd.z],
-		},
-		"position": [pos_ned.x, pos_ned.y, pos_ned.z],
-		"velocity": [vel_ned.x, vel_ned.y, vel_ned.z],
-		"quaternion": [q.w, q.x, q.y, q.z],
-		"rc": {
-			"rc_1": rc[0], "rc_2": rc[1], "rc_3": rc[2], "rc_4": rc[3],
-			# rc_6..rc_10: pendulum reaction-force feed-forward inputs (arm count, per-arm angle/rate).
-			# ch5 is skipped (FLTMODE_CH). See _update_pendulum().
-			"rc_6": pend_rc[0], "rc_7": pend_rc[1], "rc_8": pend_rc[2],
-			"rc_9": pend_rc[3], "rc_10": pend_rc[4],
-		},
-	}
 	udp.set_dest_address(client_ip, client_port)
-	udp.put_packet((JSON.stringify(state) + "\n").to_utf8_buffer())
+	udp.put_packet(SITL_PROTOCOL_SCRIPT.encode_state(
+		sim_time,
+		not lockstep,
+		gyro_frd,
+		accel_frd,
+		pos_ned,
+		vel_ned,
+		q,
+		rc,
+		pend_rc
+	))
 
 
 # ---- Independent acceleration grader (validation, SPEC §7) ----
@@ -1043,99 +907,29 @@ func _send_state() -> void:
 # FF/trim math (incl. zero-command drift), NOT hardware bias rejection (that needs the
 # Phase-4 noise model). lat true at lat_level==0 should sit at ~0 => no creep.
 const GRADE_LAT_CMD_MSS := 12.0   # must match mode_accel.cpp ACCEL_LAT_CMD_MSS (levels -> +-3/6/9/12)
-var _grade_prev_vel := Vector3.ZERO
-var _grade_t := 0.0
-# ---- transient trace: on any command change, dump per-physics-frame truth accel for a short
-# window so settle time (time to enter & HOLD within 5% of command) is measured in Python at
-# full 400 Hz resolution — the periodic [grade] line below is far too coarse to see a 40 ms rise.
-const TRACE_WINDOW := 0.15   # seconds of per-frame trace after each command change
-var _tr_prev_lat_cmd := 0.0
-var _tr_prev_up_cmd := 0.0
-var _tr_t0 := -1.0           # sim_time at the active step's command change (<0 = idle)
-var _tr_seeded := false
+var acceleration_grader = ACCELERATION_GRADER_SCRIPT.new()
 func _grade(delta: float) -> void:
-	var accel_world := (drone.linear_velocity - _grade_prev_vel) / maxf(delta, 1e-6)
-	_grade_prev_vel = drone.linear_velocity
-	if on_ground:
-		return
-	var a_lat_true := accel_world.x
-	var a_up_true := accel_world.y
-	var a_lat_cmd := lat_level / 4.0 * GRADE_LAT_CMD_MSS
-	var a_up_cmd := vert_level / 3.0 * GRAVITY
-
-	# detect a command change on either axis -> (re)open a fresh trace window
-	if not _tr_seeded:
-		_tr_prev_lat_cmd = a_lat_cmd
-		_tr_prev_up_cmd = a_up_cmd
-		_tr_seeded = true
-	if absf(a_lat_cmd - _tr_prev_lat_cmd) > 1e-3 or absf(a_up_cmd - _tr_prev_up_cmd) > 1e-3:
-		_tr_t0 = sim_time
-		print("[step] t=%.3f lat %6.2f->%6.2f up %6.2f->%6.2f" % [
-			sim_time, _tr_prev_lat_cmd, a_lat_cmd, _tr_prev_up_cmd, a_up_cmd])
-		_tr_prev_lat_cmd = a_lat_cmd
-		_tr_prev_up_cmd = a_up_cmd
-	# emit a per-frame trace line for the window following a command change
-	if _tr_t0 >= 0.0:
-		var dt_ms := (sim_time - _tr_t0) * 1000.0
-		if dt_ms <= TRACE_WINDOW * 1000.0:
-			print("[trace] dt=%6.1f lat_cmd=%6.2f lat=%7.2f up_cmd=%6.2f up=%7.2f" % [
-				dt_ms, a_lat_cmd, a_lat_true, a_up_cmd, a_up_true])
-		else:
-			_tr_t0 = -1.0
-
-	_grade_t += delta
-	if _grade_t >= 0.25:
-		_grade_t = 0.0
-		# Forward axis = NED North = -(Godot z). Must stay pinned at its captured reference (never
-		# drift fore/aft). Log absolute forward pos/vel + the lateral pos so drift can be correlated
-		# with the lateral maneuvers. accel_world.z is the forward accel (should be ~0).
-		var fwd_pos := -drone.global_position.z
-		var fwd_vel := -drone.linear_velocity.z
-		var lat_pos := drone.global_position.x
-		var lat_vel := drone.linear_velocity.x
-		var yaw_deg := rad_to_deg(drone.global_transform.basis.get_euler().y)
-		print("[grade] lat cmd=%6.2f true=%6.2f err=%+5.2f | up cmd=%6.2f true=%6.2f err=%+5.2f (m/s^2)" % [
-			a_lat_cmd, a_lat_true, a_lat_true - a_lat_cmd, a_up_cmd, a_up_true, a_up_true - a_up_cmd])
-		print("[fwd] t=%6.2f fwd_pos=%+7.3f fwd_vel=%+7.3f | lat_pos=%+8.2f lat_vel=%+7.2f yaw_deg=%+7.2f" % [
-			sim_time, fwd_pos, fwd_vel, lat_pos, lat_vel, yaw_deg])
+	acceleration_grader.update(
+		drone, delta, on_ground, sim_time, lat_level, vert_level,
+		GRADE_LAT_CMD_MSS, GRAVITY, true
+	)
 
 
 # Headless auto-test driver (AUTOTEST=1): sets the same latched levels the keyboard would, on a
 # schedule. Phase 0 parks to auto-take-off (needs ArduPilot armed + in ACCEL, done by the python
 # controller); once airborne it runs auto_profile; then holds. Grader keeps logging throughout.
 func _auto_drive() -> void:
-	var alt := drone.global_position.y
-	var vy := drone.linear_velocity.y
-	match auto_phase:
-		0:  # Climb to a safe altitude, then measure IMMEDIATELY. The workflow must NOT depend on the
-			# controller holding a hover (with the current calibration it can't) -- we only need to be
-			# high enough that drift during the ~5 s profile can't reach the ground. Gentle (+3.3) keeps
-			# the climb velocity modest so drag barely confounds the vertical measurements. The lateral
-			# (catch) axis is independent of the vertical drift, so its data is clean regardless.
-			park = false
-			lat_level = 0
-			vert_level = 1
-			if alt > 25.0:
-				auto_phase = 1
-				auto_t0 = sim_time
-				print("[auto] airborne (alt=%.1f, vy=%.1f); starting profile" % [alt, vy])
-		1:  # scripted accel profile
-			park = false
-			var tp := sim_time - auto_t0
-			var active := false
-			for step in auto_profile:
-				if tp < float(step[0]):
-					lat_level = int(step[1])
-					vert_level = int(step[2])
-					active = true
-					break
-			if not active:
-				auto_phase = 2
-				print("[auto] profile complete at t=%.1f" % tp)
-		2:  # done -- best-effort hold (may drift; the profile data is already captured)
-			park = true
-			lat_level = 0
-			vert_level = 0
+	var command := auto_profile_driver.update(
+		drone.global_position.y,
+		drone.linear_velocity.y,
+		sim_time,
+		auto_profile,
+		"[auto]",
+		true
+	)
+	park = command["park"]
+	lat_level = command["lateral_level"]
+	vert_level = command["vertical_level"]
 
 
 # ============ Phase 7: single-pendulum PHYSICS validation (no controller) ============
@@ -1153,48 +947,20 @@ var _pend_cross: Array = []
 var _pend_done := false
 
 
-# A1: replace the point-mass-on-a-massless-rod arm with a realistic DISTRIBUTED mass -- a uniform rod
-# (fraction rod_frac of the mass) plus a tip mass (the bob/sensor) at L. This shifts the CoM in from L to
-# d and lowers the swing inertia, so the arm swings ~10% faster than the point-mass model the controllers
-# assume. Set via center_of_mass + inertia (overrides the collision-shape-derived values). rod_frac=0 -> the
-# old point mass at L; rod_frac=1 -> a bare uniform rod. Env ARM_ROD_FRAC sweeps it.
-func _set_arm_distribution(arm: RigidBody3D, L: float, total: float, rod_frac: float) -> void:
-	var m_rod := total * rod_frac
-	var m_tip := total * (1.0 - rod_frac)
-	var d := (m_rod * (L * 0.5) + m_tip * L) / total                       # CoM distance from the pivot
-	var i_cm := m_rod * L * L / 12.0 + m_rod * pow(L * 0.5 - d, 2) + m_tip * pow(L - d, 2)  # about CoM, swing axis
-	arm.mass = total
-	arm.center_of_mass_mode = RigidBody3D.CENTER_OF_MASS_MODE_CUSTOM
-	arm.center_of_mass = Vector3(0, -d, 0)
-	arm.inertia = Vector3(i_cm, maxf(i_cm * 1e-3, 1e-7), i_cm)             # thin rod: ~0 about its own long (Y) axis
-
-
 # Attach the first n_arms pendulums; fully detach the rest. IMPORTANT: to detach we clear BOTH joint
 # node paths. Clearing only node_b (the old code) leaves node_a=Drone, which makes Godot anchor the
 # DRONE to a fixed point in the world -> it can never take off (that was the 0-arm takeoff regression).
 func _setup_arms() -> void:
 	var bodies := [$Arm, $Arm2]
 	var pivots := [$Pivot, $Pivot2]
-	for i in range(bodies.size()):
-		if i < n_arms:
-			arm_bodies.append(bodies[i])
-			arm_prev_theta.append(0.0)
-			arm_has_prev.append(false)
-		else:
-			# Fully remove the unused arm+joint from the sim so it can't influence the drone at all
-			# (a lingering joint would add phantom mass / reaction to the "bare" frame). Clear the joint
-			# paths first (breaks the constraint this frame), then free the nodes.
-			pivots[i].node_a = NodePath("")   # clear BOTH -> no world anchor, no coupling
-			pivots[i].node_b = NodePath("")
-			pivots[i].queue_free()
-			bodies[i].queue_free()
+	pendulum_chain.configure(bodies, pivots, n_arms)
+	arm_bodies = pendulum_chain.bodies
 	# A1: give each active arm a realistic distributed (rod + tip) mass instead of a point mass at L.
-	var arm_len := [0.7, 0.6]
+	var arm_len: Array[float] = [0.7, 0.6]
 	var rod_frac := 0.7
 	var rf := OS.get_environment("ARM_ROD_FRAC")
 	if rf != "": rod_frac = float(rf)
-	for i in range(arm_bodies.size()):
-		_set_arm_distribution(arm_bodies[i], float(arm_len[i]), 0.1, rod_frac)
+	pendulum_chain.configure_distributed_mass(arm_len, 0.1, rod_frac)
 	print("[arms] %d pendulum arm(s) attached; distributed rod_frac=%.2f (0=point@L, 1=uniform rod)" % [n_arms, rod_frac])
 
 
@@ -1213,6 +979,14 @@ func _balance_setup() -> void:
 		var cfg := {"L1": 0.7, "L2": 0.6, "g": GRAVITY, "a_max": 12.0, "s_ref": 0.0}
 		for k in BAL_GAINS2:
 			cfg[k] = BAL_GAINS2[k]
+		# Lower loop gain avoids the noisy delayed plant's alternating rail hits.
+		# Set BALANCE_GAIN_SCALE=1 to reproduce the original tuning.
+		var gain_scale := 0.5
+		var gain_env := OS.get_environment("BALANCE_GAIN_SCALE")
+		if gain_env != "":
+			gain_scale = float(gain_env)
+		for k in BAL_GAINS2:
+			cfg[k] *= gain_scale
 		balance_ctrl = ArmBalance2.new()
 		balance_ctrl.configure(cfg)
 	else:
@@ -1246,41 +1020,27 @@ func _balance_setup() -> void:
 	print("[bal] BALANCE_ONBOARD active: %d link(s), alt=%.1f m, init=(%.1f, %.1f) deg, bump_dv=%.2f" % [
 		n_arms, balance_alt, balance_init_deg, balance_init2_deg, _bal_bump_dv])
 
-	# frame the balancing stack (the default camera was aimed at the ground-level accel tests)
-	var cam := $Camera3D
-	cam.current = true
-	cam.global_position = Vector3(0.0, balance_alt + 0.6, 3.5)
-	cam.look_at(Vector3(0.0, balance_alt + 0.6, 0.0), Vector3.UP)
+	# Keep the Camera3D transform/FOV authored in main.tscn so the recording
+	# perspective can be adjusted directly in the editor.
+	$Camera3D.current = true
 
-	# live strip-charts (same accel_graph widget as balance2_test), stacked at the bottom, full width:
-	# TOP = commanded a_cmd vs the REAL realised lateral accel (full loop, not the idealized lag);
-	# BOTTOM = the two link angles. Fed each tick from _bal_record.
-	var gscript = load("res://accel_graph.gd")
-	bal_graph_u = gscript.new()
-	bal_graph_ang = gscript.new()
-	# TOP of screen (the HUD draws a full-width panel across the bottom 300 px -- keep clear of it,
-	# and its Position chart then stays visible for watching the fore/aft axis).
-	for gg in [bal_graph_u, bal_graph_ang]:
-		gg.anchor_left = 0.0; gg.anchor_top = 0.0; gg.anchor_right = 1.0; gg.anchor_bottom = 0.0
-		gg.offset_left = 10.0; gg.offset_right = -10.0
-		$CanvasLayer.add_child(gg)
-		gg.setup(2.0)
-	bal_graph_u.offset_top = 8.0;     bal_graph_u.offset_bottom = 150.0     # accel graph (top)
-	bal_graph_ang.offset_top = 158.0; bal_graph_ang.offset_bottom = 300.0   # angle graph (below it)
-	bal_graph_u.title = "single input a_x [m/s^2]  (a_cmd vs REAL ModeAccel realised)"
-	bal_graph_ang.title = "link angles [deg]"
-	bal_graph_ang.label1 = "link1 theta (0.7 m)"
-	bal_graph_ang.label2 = "link2 theta (0.6 m)"
-
-	# colour the links so they read clearly at a glance: link1 = red, link2 = blue
-	_bal_colour_link(arm_bodies[0], Color(0.90, 0.20, 0.20))
-	if n_arms >= 2:
-		_bal_colour_link(arm_bodies[1], Color(0.25, 0.50, 1.00))
+	# Normal recordings use one shallow lateral chart above the vehicle. RESPONSE_VIDEO=1
+	# splits that band into lateral and vertical command/realised charts.
+	var graphs := SCENARIO_VISUALS_SCRIPT.create_recording_graphs(
+		$CanvasLayer,
+		graph_window_seconds,
+		response_video_overlay
+	)
+	bal_graph_u = graphs[0]
+	bal_graph_vertical = graphs[1] if graphs.size() > 1 else null
+	bal_angle_readout = SCENARIO_VISUALS_SCRIPT.create_angle_readout($CanvasLayer)
+	SCENARIO_VISUALS_SCRIPT.colour_links(arm_bodies)
 
 
 # ---- SWINGUP: portable C++ SwingUp on the REAL ModeAccel. Arm(s) start HANGING; the controller pumps up
 # (lateral + vertical) then gates into ArmBalance. Grades on TRUTH link angle, auto-exits headless.
 func _swingup_setup() -> void:
+	swingup_run_tracker.configure(swingup_hold_time, SWINGUP_RUN_TIME)
 	# tunable from env (the real stack loses energy the idealized cart didn't, so k=3 not the idealized k=1).
 	# The double's basin is tiny, so its gate defaults are tighter.
 	# The added realism (hinge friction + bob drag + distributed mass) drains swing energy, so the single arm
@@ -1337,34 +1097,21 @@ func _swingup_setup() -> void:
 	print("[swingup] SWINGUP active: %d link(s), alt=%.1f m, init=%.1f deg from hang" % [
 		n_arms, swingup_alt, swingup_init_deg])
 
-	var cam := $Camera3D
-	cam.current = true
-	cam.global_position = Vector3(0.0, swingup_alt, 4.6)
-	cam.look_at(Vector3(0.0, swingup_alt, 0.0), Vector3.UP)
-	_bal_colour_link(arm_bodies[0], Color(0.90, 0.20, 0.20))
-	if n_arms >= 2:
-		_bal_colour_link(arm_bodies[1], Color(0.25, 0.50, 1.00))
+	# Keep the Camera3D transform/FOV authored in main.tscn.
+	$Camera3D.current = true
+	SCENARIO_VISUALS_SCRIPT.colour_links(arm_bodies)
 
-	# live strip-charts (only with a display): TOP = commanded lateral accel vs the REAL realised accel
-	# (same as the balance demo -- the orange 'realised' line tracks the blue 'cmd' with the ModeAccel
-	# lag); BOTTOM = the two link angles from up. Fed (decimated) from _swingup_record.
+	# Recording overlay: one lateral chart by default; RESPONSE_VIDEO=1 adds vertical tracking.
+	# Link angles stay visible as values at the side instead of obscuring the vehicle with another plot.
 	if DisplayServer.get_name() != "headless":
-		var gscript = load("res://accel_graph.gd")
-		bal_graph_u = gscript.new()
-		bal_graph_ang = gscript.new()
-		for gg in [bal_graph_u, bal_graph_ang]:
-			gg.anchor_left = 0.0; gg.anchor_top = 0.0; gg.anchor_right = 1.0; gg.anchor_bottom = 0.0
-			gg.offset_left = 10.0; gg.offset_right = -10.0
-			$CanvasLayer.add_child(gg)
-			gg.setup(2.5)
-		bal_graph_u.offset_top = 8.0;     bal_graph_u.offset_bottom = 150.0     # accel graph (top)
-		bal_graph_ang.offset_top = 158.0; bal_graph_ang.offset_bottom = 300.0   # angle graph (below it)
-		bal_graph_u.title = "lateral accel a_lat [m/s^2]  (cmd vs REAL ModeAccel realised)"
-		bal_graph_u.label1 = "a_lat cmd"
-		bal_graph_u.label2 = "a_lat realised"
-		bal_graph_ang.title = "link angles from up [deg]   (0 = both upright)"
-		bal_graph_ang.label1 = "link1 (0.7 m)"
-		bal_graph_ang.label2 = "link2 (0.6 m)"
+		var graphs := SCENARIO_VISUALS_SCRIPT.create_recording_graphs(
+			$CanvasLayer,
+			graph_window_seconds,
+			response_video_overlay
+		)
+		bal_graph_u = graphs[0]
+		bal_graph_vertical = graphs[1] if graphs.size() > 1 else null
+		bal_angle_readout = SCENARIO_VISUALS_SCRIPT.create_angle_readout($CanvasLayer)
 
 
 # TRUTH |angle from up| of a link [deg]; 0 = upright. (Same convention as the balance grader.)
@@ -1373,54 +1120,69 @@ func _link_up_deg(i: int) -> float:
 	return absf(wrapf(atan2(rod.x, rod.y), -PI, PI)) * 180.0 / PI
 
 
+func _link_signed_up_deg(i: int) -> float:
+	var rod: Vector3 = arm_bodies[i].global_transform.basis * Vector3(0, -1, 0)
+	return rad_to_deg(wrapf(atan2(rod.x, rod.y), -PI, PI))
+
+
+func _push_analysis_samples(
+	sample_time: float,
+	lateral_command: float,
+	vertical_command: float
+) -> void:
+	if not bal_graph_u:
+		return
+	var lateral_realised := _imu_accel_world.x
+	var angles: Array[float] = [_link_signed_up_deg(0)]
+	if n_arms >= 2:
+		angles.append(_link_signed_up_deg(1))
+	bal_graph_u.push_sample(sample_time, lateral_command, lateral_realised)
+	SCENARIO_VISUALS_SCRIPT.update_angle_readout(
+		bal_angle_readout,
+		angles,
+		_overlay_balance_on,
+		_overlay_vehicle_command,
+		_overlay_reaction_ff_on
+	)
+	if bal_graph_vertical:
+		# _imu_accel_world is specific force (a - gravity); subtract g to recover
+		# the net upward kinematic acceleration that a_vert commands around hover.
+		var vertical_realised := _imu_accel_world.y - GRAVITY
+		bal_graph_vertical.push_sample(
+			sample_time,
+			vertical_command,
+			vertical_realised
+		)
+
+
 func _swingup_record(delta: float, balancing: bool) -> void:
-	_su_t += delta
 	var up_deg := _link_up_deg(0)
 	if n_arms >= 2:
 		up_deg = maxf(up_deg, _link_up_deg(1))   # BOTH links must be up (double)
+	var run_time: float = swingup_run_tracker.elapsed + delta
 
 	# feed the live strip-charts, DECIMATED to ~100 Hz (grading above runs every tick; only the graph
 	# push is throttled): a_lat cmd vs the REAL realised lateral accel + TRUTH signed link angles from up.
 	_su_graph_n += 1
 	if bal_graph_u and _su_graph_n % 4 == 0:
-		var rod1: Vector3 = arm_bodies[0].global_transform.basis * Vector3(0, -1, 0)
-		var a1u := atan2(rod1.x, rod1.y) * 180.0 / PI
-		var a2u := 0.0
-		if n_arms >= 2:
-			var rod2: Vector3 = arm_bodies[1].global_transform.basis * Vector3(0, -1, 0)
-			a2u = atan2(rod2.x, rod2.y) * 180.0 / PI
-		bal_graph_u.push_sample(_su_t, _su_lat_cmd, _imu_accel_world.x)
-		bal_graph_ang.push_sample(_su_t, a1u, a2u)
-	if _su_t - _su_dbg >= 1.0:
-		_su_dbg = _su_t
+		_push_analysis_samples(run_time, _su_lat_cmd, _su_up_cmd)
+	if run_time - _su_dbg >= 1.0:
+		_su_dbg = run_time
 		print("  [su] t=%4.1f  link_up=%5.1f  th_down=%6.1f  alt=%5.2f  x=%+5.2f vx=%+5.2f  a_lat=%+5.1f a_up=%+5.1f  %s" % [
-			_su_t, up_deg, rad_to_deg(arm_theta[0]), drone.global_position.y,
+			run_time, up_deg, rad_to_deg(arm_theta[0]), drone.global_position.y,
 			drone.global_position.x, drone.linear_velocity.x, _su_lat_cmd, _su_up_cmd,
 			("BAL" if balancing else "pump")])
-	if balancing and not _su_caught:
-		_su_caught = true
-		_su_catch_t = _su_t
-		print("[swingup] CAUGHT at t=%.2f s (worst link %.1f deg from up)" % [_su_t, up_deg])
-	# release when the post-catch hold has elapsed (or the hard cap, if never caught)
-	var t_release := (_su_catch_t + swingup_hold_time) if _su_caught else SWINGUP_RUN_TIME
-	if _su_caught:
-		_su_max_up_after = maxf(_su_max_up_after, up_deg)
-		# steady-state check: last <=4 s of the hold, but always AFTER the catch transient settles
-		if _su_t >= maxf(_su_catch_t + 0.5, t_release - 4.0):
-			_su_max_up_hold = maxf(_su_max_up_hold, up_deg)
-	if _su_t >= t_release and not _su_done:
-		_su_done = true
-		_su_passed = _su_caught and _su_max_up_hold < 15.0
-		print("[swingup] RESULT caught=%d t_catch=%.2f hold=%.1fs max_after=%.1fdeg hold_max=%.1fdeg => %s" % [
-			int(_su_caught), _su_catch_t, swingup_hold_time, _su_max_up_after, _su_max_up_hold,
-			("PASS" if _su_passed else "FAIL")])
-		print("[swingup] releasing -> arms drop, drone holds hover")
-		_su_released = true
+	var was_released: bool = swingup_run_tracker.released
+	swingup_run_tracker.update(delta, balancing, up_deg)
+	if not was_released and swingup_run_tracker.released and bal_graph_u:
+		bal_graph_u.add_event(run_time, "arm release")
+		if bal_graph_vertical:
+			bal_graph_vertical.add_event(run_time, "arm release")
 
 
 # Grade the balance loop on TRUTH arm angle (from up), independent of the sensed signal the controller closed on.
 # Track max/final angle, control effort, saturation; apply an optional mid-run cart-velocity bump; finish at 15 s.
-func _bal_record(delta: float, a_cmd: float) -> void:
+func _bal_record(delta: float, a_cmd: float, vertical_command: float) -> void:
 	var rod1: Vector3 = arm_bodies[0].global_transform.basis * Vector3(0, -1, 0)
 	var th1_up := atan2(rod1.x, rod1.y)
 	_bal_max1 = maxf(_bal_max1, absf(th1_up) * 180.0 / PI)
@@ -1429,11 +1191,13 @@ func _bal_record(delta: float, a_cmd: float) -> void:
 		var rod2: Vector3 = arm_bodies[1].global_transform.basis * Vector3(0, -1, 0)
 		th2_up = atan2(rod2.x, rod2.y)
 		_bal_max2 = maxf(_bal_max2, absf(th2_up) * 180.0 / PI)
+	if _bal_t > 5.0 and delta > 0.0:
+		_bal_sum_jerk2 += pow((a_cmd - _bal_previous_cmd) / delta, 2)
+		_bal_jerk_n += 1
+	_bal_previous_cmd = a_cmd
 	_bal_sum_cmd2 += a_cmd * a_cmd
 	_bal_n += 1
-	if bal_graph_u:
-		bal_graph_u.push_sample(_bal_t, a_cmd, _imu_accel_world.x)                       # cmd vs REAL realised accel
-		bal_graph_ang.push_sample(_bal_t, th1_up * 180.0 / PI, th2_up * 180.0 / PI)      # link1 / link2 angle
+	_push_analysis_samples(_bal_t, a_cmd, vertical_command)
 
 	# mid-run lateral velocity bump (perturbs the pivot), like balance_test's cart bump
 	if not _bal_bumped and _bal_t >= _bal_bump_t and _bal_bump_dv != 0.0:
@@ -1461,32 +1225,20 @@ func _bal_finish(th1_up: float, th2_up: float) -> void:
 	print("RESULT_BAL arms=%d noise=%d ff=%d | link1 max=%.2f final=%.3f | link2 max=%.2f final=%.3f | rms_u=%.2f sat=%d alt=%.2f => %s" % [
 		n_arms, int(sensor_noise_enabled), int(reaction_ff_on), _bal_max1, f1, _bal_max2, f2, rms,
 		int(_bal_sat), drone.global_position.y, ("PASS" if passed else "FAIL")])
+	print("BALANCE_SMOOTHNESS jerk_rms=%.3f m/s^3 (after 5s)" % sqrt(_bal_sum_jerk2 / maxf(1.0, float(_bal_jerk_n))))
 	# headless: a failed balance is done; a passing one goes on to prove the release-and-hover below.
 	if DisplayServer.get_name() == "headless" and not passed:
 		get_tree().quit(2)
 		return
 	_bal_released = true    # balance OFF -> arms drop freely; _service_native now just holds a hover
+	if bal_graph_u:
+		bal_graph_u.add_event(_bal_t, "arm release")
+		if bal_graph_vertical:
+			bal_graph_vertical.add_event(_bal_t, "arm release")
 	print("[bal] t=%.0fs: balance released -> arms dropping, holding hover" % BAL_RUN_TIME)
 
 
 # Colour a link so the two read clearly at a glance: tint its rod + add a visible bob sphere.
-func _bal_colour_link(arm: Node3D, col: Color) -> void:
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = col
-	var rod := arm.get_node_or_null("Rod")
-	if rod:
-		rod.material_override = mat
-	var bob := arm.get_node_or_null("Bob")
-	if bob:
-		var mi := MeshInstance3D.new()
-		var sph := SphereMesh.new()
-		sph.radius = 0.05
-		sph.height = 0.10
-		mi.mesh = sph
-		mi.material_override = mat
-		bob.add_child(mi)
-
-
 # Sample each active arm's angle (from straight-down, + toward +lateral/+X) and angular rate, and pack
 # them + the arm count into pend_rc (rc_6..rc_10) for _send_state. The controller uses these to cancel
 # the reaction force. theta comes from the arm's orientation (rod dir = basis*(0,-1,0)); yaw is held ~0
@@ -1494,18 +1246,12 @@ func _bal_colour_link(arm: Node3D, col: Color) -> void:
 func _update_pendulum(delta: float) -> void:
 	pend_rc[0] = 1000 + n_arms * 100
 	pend_rc[1] = 1500; pend_rc[2] = 1500; pend_rc[3] = 1500; pend_rc[4] = 1500
-	arm_theta[0] = 0.0; arm_theta[1] = 0.0
-	arm_theta_dot[0] = 0.0; arm_theta_dot[1] = 0.0
+	var measurement := pendulum_chain.sample(delta, arm_theta.size())
+	arm_theta = measurement["angles"]
+	arm_theta_dot = measurement["rates"]
 	for i in range(n_arms):
-		var rod := arm_bodies[i].global_transform.basis * Vector3(0, -1, 0)  # pivot->bob direction (world)
-		var theta := atan2(rod.x, -rod.y)                                     # 0 = straight down, + toward +X
-		var dtheta := 0.0
-		if arm_has_prev[i]:
-			dtheta = wrapf(theta - arm_prev_theta[i], -PI, PI) / maxf(delta, 1e-6)
-		arm_prev_theta[i] = theta
-		arm_has_prev[i] = true
-		arm_theta[i] = theta            # raw floats for the native path (no PWM round-trip)
-		arm_theta_dot[i] = dtheta
+		var theta: float = arm_theta[i]
+		var dtheta: float = arm_theta_dot[i]
 		pend_rc[1 + i * 2] = 1500 + int(round(clampf(theta, -PI, PI) / PI * 500.0))
 		pend_rc[2 + i * 2] = 1500 + int(round(clampf(dtheta, -PEND_RATE_MAX, PEND_RATE_MAX) / PEND_RATE_MAX * 500.0))
 

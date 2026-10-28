@@ -19,32 +19,7 @@ height = 0.6
 
 [node name="Main" type="Node3D" unique_id=44096971]
 script = ExtResource("1_0xm2m")
-use_ardupilot = null
-use_native = null
-drive_from_pwm = null
-lateral_step_test = null
-enable_pendulum = null
-pendulum_test = null
 sensor_noise_enabled = true
-sensor_pos_drift = null
-sensor_seed = null
-sig_gyro_dps = null
-sig_accel = null
-sig_att_deg = null
-sig_vel = null
-sig_pos = null
-sig_theta0_deg = null
-sig_theta1_deg = null
-enc_lsb_deg = null
-sig_thetadot0_dps = null
-sig_thetadot1_dps = null
-pos_drift_rate = null
-lat_imu_ms = null
-lat_ekf_att_ms = null
-lat_ekf_vel_ms = null
-lat_ekf_pos_ms = null
-lat_arm_ms = null
-lat_arm_ang_imu_ms = null
 
 [node name="Drone" type="RigidBody3D" parent="." unique_id=1629213624]
 center_of_mass_mode = 1
@@ -95,7 +70,7 @@ node_a = NodePath("../Arm")
 node_b = NodePath("../Arm2")
 
 [node name="Camera3D" type="Camera3D" parent="." unique_id=295898983]
-transform = Transform3D(0.9999905, 0.0011473779, -0.0042085876, 0, 0.9647882, 0.2630281, 0.0043621883, -0.26302558, 0.964779, -0.008917405, 0.5573196, 2.0442312)
+transform = Transform3D(0.9999905, 0.0011473781, -0.0042085885, -0.0012367745, 0.9997723, -0.021300673, 0.0041831895, 0.02130568, 0.9997642, -0.009, 10.5, 2.567)
 
 [node name="Node3D" type="Node3D" parent="." unique_id=261539321]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -0.24482313, 0.01999379, -0.30835363)
