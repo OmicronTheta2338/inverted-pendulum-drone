@@ -16,7 +16,19 @@ extends Node3D
 #   BALANCE_INIT_DEG / _INIT2_DEG / _INIT3_DEG (default 0.5 deg -- basin is sub-degree!)
 #   BALANCE_ALT (default 10)        SENSOR_SEED, SENSOR_LAT_*  (as main.gd)
 
+const SENSOR_MODEL_SCRIPT := preload("res://simulation/sensor_model.gd")
+const PENDULUM_CHAIN_SCRIPT := preload("res://simulation/pendulum_chain.gd")
+const MOTOR_DYNAMICS_SCRIPT := preload("res://simulation/motor_dynamics.gd")
+const VEHICLE_PLANT_SCRIPT := preload("res://simulation/vehicle_plant.gd")
+const PILOT_INPUT_SCRIPT := preload("res://simulation/pilot_input.gd")
+const AUTO_PROFILE_DRIVER_SCRIPT := preload("res://simulation/auto_profile_driver.gd")
+const ACCELERATION_GRADER_SCRIPT := preload("res://simulation/acceleration_grader.gd")
+const SCENARIO_VISUALS_SCRIPT := preload("res://simulation/scenario_visuals.gd")
+
 @onready var drone: RigidBody3D = $Drone
+
+@export var response_video_overlay := false
+@export var graph_window_seconds := 6.0
 
 const MASS := 1.0
 const INERTIA := Vector3(0.01616, 0.04272, 0.02674)
@@ -51,6 +63,8 @@ const NATIVE_YAW_RATE := 0.7854
 
 # ---- native flight stack (triple) ----
 var flightstack                            # ApFlightStack3
+var sensor_model = SENSOR_MODEL_SCRIPT.new()
+var pendulum_chain = PENDULUM_CHAIN_SCRIPT.new()
 var _imu_prev_vel := Vector3.ZERO
 var _imu_accel_world := Vector3.ZERO
 
@@ -59,8 +73,6 @@ var n_arms := 3
 var reaction_ff_on := true
 var post_ff := true   # keep the reaction FF on after the balance run ends (env POSTREL_FF=0 disables, for diagnosis)
 var arm_bodies: Array[RigidBody3D] = []
-var arm_prev_theta: Array[float] = []
-var arm_has_prev: Array[bool] = []
 var arm_theta := [0.0, 0.0, 0.0]           # from straight-DOWN, + toward +X (native path input)
 var arm_theta_dot := [0.0, 0.0, 0.0]
 
@@ -68,7 +80,11 @@ var arm_theta_dot := [0.0, 0.0, 0.0]
 var balance_onboard := false
 var balance_ctrl                           # ArmBalance3
 var bal_graph_u                            # top strip-chart: a_cmd vs REAL realised lateral accel
-var bal_graph_ang                          # top strip-chart: the three link angles
+var bal_graph_vertical                     # optional response-video chart: vertical command vs realised
+var bal_angle_readout: Label               # compact numeric link-angle display beside the vehicle
+var _overlay_balance_on := false
+var _overlay_vehicle_command := "HOLD POSITION"
+var _overlay_reaction_ff_on := false
 var balance_init := [0.5, 0.5, 0.5]        # per-link start lean from upright [deg] (tiny: basin sub-degree)
 var balance_alt := 10.0
 const BAL_RUN_TIME := 15.0
@@ -93,45 +109,29 @@ var _rv_ref_lat := 0.0
 var _rv_ref_up := 0.0
 var _rv_n := 0
 
-# ---- sensor model (harness-side, OFF by default) -- 3-encoder chain ----
-@export var sensor_noise_enabled := false
-@export var sensor_pos_drift := true
+# ---- sensor model (harness-side, ON by default) -- 3-encoder chain ----
+@export var sensor_noise_enabled := true
 @export var sensor_seed := 1
+@export var arm_imu_distance := 0.10 # metres from proximal pivot; set to actual mounting location
+@export var sig_arm_accel := 0.35 # local accelerometer sigma [m/s^2]
+@export var sig_arm_gyro_dps := 0.4 # local gyro sigma [deg/s]
+@export var encoder_rate_tau := 0.02 # differentiated encoder low-pass [s]
+@export var arm_observer_tau := 0.5 # complementary gravity correction [s]
 @export var sig_gyro_dps := 0.05
 @export var sig_accel := 0.35
 @export var sig_att_deg := 0.1
-@export var sig_vel := 0.03
-@export var sig_pos := 0.02
-@export var sig_theta0_deg := 0.15         # link1 angle [deg] (2xIMU fused)
 @export var sig_enc_deg := 0.10            # joint encoder angle [deg] (magnetic, both joints)
 @export var enc_lsb_deg := 0.05            # encoder quantization step [deg]
-@export var sig_thetadot0_dps := 0.4       # link1 rate [deg/s] (differential gyro)
-@export var sig_encdot_dps := 1.0          # differentiated encoder rate [deg/s]
-@export var pos_drift_rate := 0.015
 @export var lat_imu_ms := 2.5
 @export var lat_ekf_att_ms := 8.0
 @export var lat_ekf_vel_ms := 20.0
 @export var lat_ekf_pos_ms := 20.0
 @export var lat_arm_ms := 2.5              # clean encoder / differential-gyro read
 @export var lat_arm_ang_imu_ms := 8.0      # link1 IMU-fused angle (deeper)
-var sensor_rng := RandomNumberGenerator.new()
-var _hist: Array = []
-var _sb_idx := 0
-var _sb_len := 1
-var _sensor_seeded := false
-var _d_imu := 1
-var _d_att := 3
-var _d_vel := 8
-var _d_pos := 8
-var _d_arm := 1
-var _d_arm_imu := 3
-var _gyro_bias := Vector3.ZERO
-var _pos_drift := Vector3.ZERO
 
 # ---- headless auto-test (AUTOTEST=1): scripted accel profile, self-excites the swing ----
 var auto_test := false
-var auto_phase := 0
-var auto_t0 := 0.0
+var auto_profile_driver = AUTO_PROFILE_DRIVER_SCRIPT.new()
 var auto_profile := [
 	[0.6, 0, 0], [1.1, 1, 0], [1.6, 0, 0], [2.1, 2, 0], [2.6, 0, 0],
 	[3.1, 4, 0], [3.6, 0, 0], [4.1, -2, 0], [4.6, 0, 0], [5.1, -4, 0], [5.6, 0, 0],
@@ -139,8 +139,7 @@ var auto_profile := [
 	[15.6, 2, 0], [16.1, 0, 0], [22.1, -2, 0], [22.6, 0, 0],
 ]
 
-var _grade_prev_vel := Vector3.ZERO
-var _grade_t := 0.0
+var acceleration_grader = ACCELERATION_GRADER_SCRIPT.new()
 
 
 func _ready() -> void:
@@ -172,6 +171,10 @@ func _ready() -> void:
 	post_ff = OS.get_environment("POSTREL_FF") != "0"
 	_rv_on = OS.get_environment("REACT_VALIDATE") == "1"
 	balance_onboard = editor_demo or OS.get_environment("BALANCE_ONBOARD") == "1"
+	response_video_overlay = response_video_overlay or OS.get_environment("RESPONSE_VIDEO") == "1"
+	var graph_window_env := OS.get_environment("GRAPH_WINDOW_SECONDS")
+	if graph_window_env != "":
+		graph_window_seconds = maxf(float(graph_window_env), 1.0)
 
 	flightstack = ApFlightStack3.new()
 	print("[native3] in-process TRIPLE flight stack active (ApFlightStack3 / ModeAccel3)")
@@ -193,26 +196,12 @@ func _input(event: InputEvent) -> void:
 		if event.keycode == KEY_SPACE:
 			park = true
 		else:
-			match event.keycode:
-				KEY_A: lat_level = -4
-				KEY_S: lat_level = -3
-				KEY_D: lat_level = -2
-				KEY_F: lat_level = -1
-				KEY_G: lat_level = 0
-				KEY_H: lat_level = 1
-				KEY_J: lat_level = 2
-				KEY_K: lat_level = 3
-				KEY_L: lat_level = 4
-				KEY_Z: vert_level = -3
-				KEY_X: vert_level = -2
-				KEY_C: vert_level = -1
-				KEY_V: vert_level = 0
-				KEY_B: vert_level = 1
-				KEY_N: vert_level = 2
-				KEY_M: vert_level = 3
-			var accel_keys := [KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H, KEY_J, KEY_K, KEY_L,
-				KEY_Z, KEY_X, KEY_C, KEY_V, KEY_B, KEY_N, KEY_M]
-			if event.keycode in accel_keys:
+			var command := PILOT_INPUT_SCRIPT.decode_acceleration_key(event.keycode)
+			if command.x == PILOT_INPUT_SCRIPT.AXIS_LATERAL:
+				lat_level = command.y
+			elif command.x == PILOT_INPUT_SCRIPT.AXIS_VERTICAL:
+				vert_level = command.y
+			if command.x != PILOT_INPUT_SCRIPT.AXIS_NONE:
 				park = false
 
 
@@ -250,13 +239,20 @@ func _service_native(delta: float) -> void:
 			"accel_ef": accel_ef, "gyro": gyro_frd, "quat": quat, "vel_ned": vel_ned, "pos_ned": pos_ned,
 			"theta0": th[0], "theta1": th[1], "theta2": th[2], "tdot0": td[0], "tdot1": td[1], "tdot2": td[2],
 		}
-		var s := _sensed_state(truth, delta)
+		truth.merge(pendulum_chain.first_arm_imu(delta, GRAVITY, arm_imu_distance))
+		var total_motor_thrust := MOTOR_DYNAMICS_SCRIPT.total_thrust(motor_thrust)
+		var s := sensor_model.sample(truth, delta, total_motor_thrust)
 		accel_ef = s["accel_ef"]; gyro_frd = s["gyro"]; quat = s["quat"]
 		vel_ned = s["vel_ned"]; pos_ned = s["pos_ned"]
 		th = [s["theta0"], s["theta1"], s["theta2"]]
 		td = [s["tdot0"], s["tdot1"], s["tdot2"]]
 
 	flightstack.set_state(accel_ef, vel_ned, pos_ned, true, true, quat, gyro_frd)
+
+	# All outer loops use the same navigation estimate as the native stack.
+	# P maps world to NED; convert back without reading the rigid-body truth.
+	var estimated_position := P.inverse() * pos_ned
+	var estimated_velocity := P.inverse() * vel_ned
 
 	var lat_stick := lat_level / 4.0
 	var up_stick := vert_level / 3.0
@@ -265,8 +261,8 @@ func _service_native(delta: float) -> void:
 	if balance_onboard and not _bal_done:
 		# Feed ArmBalance3 the SAME sensed arm state as the reaction FF, re-expressed in ITS
 		# convention: sensed th/td are from straight-DOWN -> theta_up = wrap(PI - th), rate flips sign.
-		var s_lat := drone.global_position.x
-		var v_lat := drone.linear_velocity.x
+		var s_lat := estimated_position.x
+		var v_lat := estimated_velocity.x
 		var a_cmd: float = balance_ctrl.update(
 			wrapf(PI - th[0], -PI, PI), -td[0],
 			wrapf(PI - th[1], -PI, PI), -td[1],
@@ -275,19 +271,30 @@ func _service_native(delta: float) -> void:
 		if balance_ctrl.last_saturated():
 			_bal_sat = true
 		lat_stick = clampf(a_cmd / 12.0, -1.0, 1.0)   # ACCEL_LAT_CMD_MSS = 12
-		var alt_err := balance_alt - drone.global_position.y
-		up_stick = clampf((2.0 * alt_err - 2.0 * drone.linear_velocity.y) / GRAVITY, -1.0, 1.0)
+		var alt_err := balance_alt - estimated_position.y
+		up_stick = clampf((2.0 * alt_err - 2.0 * estimated_velocity.y) / GRAVITY, -1.0, 1.0)
+		_overlay_balance_on = true
+		_overlay_vehicle_command = "BALANCE"
+		_overlay_reaction_ff_on = ff_arms > 0
 		park = false
-		_bal_record(delta, a_cmd)
+		_bal_record(delta, a_cmd, up_stick * GRAVITY)
 	elif balance_onboard:
 		# balance done -> the triple drops. FF stays on by default (POSTREL_FF=0 to test off); hold a hover.
 		if not post_ff:
 			ff_arms = 0
-		lat_stick = clampf((-1.5 * drone.global_position.x - 3.0 * drone.linear_velocity.x) / 12.0, -1.0, 1.0)
-		up_stick = clampf((2.0 * (balance_alt - drone.global_position.y) - 2.0 * drone.linear_velocity.y) / GRAVITY, -1.0, 1.0)
+		_overlay_balance_on = false
+		_overlay_vehicle_command = "HOLD POSITION"
+		_overlay_reaction_ff_on = ff_arms > 0
+		lat_stick = clampf((-1.5 * estimated_position.x - 3.0 * estimated_velocity.x) / 12.0, -1.0, 1.0)
+		up_stick = clampf((2.0 * (balance_alt - estimated_position.y) - 2.0 * estimated_velocity.y) / GRAVITY, -1.0, 1.0)
 		park = false
 		var _pp := _bal_post_t
 		_bal_post_t += delta
+		_push_analysis_samples(
+			_bal_t + _bal_post_t,
+			lat_stick * 12.0,
+			up_stick * GRAVITY
+		)
 		if _bal_post_t < 121.0 and int(_bal_post_t) != int(_pp):
 			var e := drone.global_transform.basis.get_euler()
 			var wmax: float = rad_to_deg(maxf(maxf(absf(arm_theta_dot[0]), absf(arm_theta_dot[1])), absf(arm_theta_dot[2])))
@@ -298,8 +305,7 @@ func _service_native(delta: float) -> void:
 		if DisplayServer.get_name() == "headless" and _bal_post_t >= 120.0:
 			get_tree().quit(0)
 	else:
-		if Input.is_key_pressed(KEY_E): yaw += 1.0
-		if Input.is_key_pressed(KEY_Q): yaw -= 1.0
+		yaw = float(PILOT_INPUT_SCRIPT.yaw_direction())
 
 	# hold attitude level during the post-drop phase: the pitch-based fore/aft hold + a whipping arm form a
 	# parametric pump (see diagnosis). Level attitude breaks the coupling; balance/flight keep it off.
@@ -315,159 +321,75 @@ func _service_native(delta: float) -> void:
 
 # ---- sensor model: 3-encoder chain (see file header + plan appendix) ----
 func _sensor_setup() -> void:
-	if OS.get_environment("USE_SENSOR_NOISE") == "1":
-		sensor_noise_enabled = true
+	if OS.get_environment("USE_SENSOR_NOISE") != "":
+		sensor_noise_enabled = OS.get_environment("USE_SENSOR_NOISE") != "0"
 	var v := OS.get_environment("SENSOR_SEED");        if v != "": sensor_seed = int(v)
-	if OS.get_environment("SENSOR_POS_DRIFT") == "0":  sensor_pos_drift = false
 	v = OS.get_environment("SENSOR_LAT_EKF_ATT_MS");   if v != "": lat_ekf_att_ms = float(v)
 	v = OS.get_environment("SENSOR_LAT_EKF_VEL_MS");   if v != "": lat_ekf_vel_ms = float(v)
 	v = OS.get_environment("SENSOR_LAT_EKF_POS_MS");   if v != "": lat_ekf_pos_ms = float(v)
 	v = OS.get_environment("SENSOR_LAT_ARM_IMU_MS");   if v != "": lat_arm_ang_imu_ms = float(v)
 	v = OS.get_environment("SENSOR_LAT_ARM_RATE_MS");  if v != "": lat_arm_ms = float(v)
-	sensor_rng.seed = sensor_seed
-	var ticks := float(Engine.physics_ticks_per_second)
-	_d_imu = int(round(lat_imu_ms     / 1000.0 * ticks))
-	_d_att = int(round(lat_ekf_att_ms / 1000.0 * ticks))
-	_d_vel = int(round(lat_ekf_vel_ms / 1000.0 * ticks))
-	_d_pos = int(round(lat_ekf_pos_ms / 1000.0 * ticks))
-	_d_arm = int(round(lat_arm_ms     / 1000.0 * ticks))
-	_d_arm_imu = int(round(lat_arm_ang_imu_ms / 1000.0 * ticks))
-	_sb_len = maxi(maxi(maxi(_d_imu, _d_att), maxi(_d_vel, _d_pos)), maxi(_d_arm, _d_arm_imu)) + 1
-	_hist.resize(_sb_len)
-	_sb_idx = 0
-	_sensor_seeded = false
+	sensor_model.configure({
+		"seed": sensor_seed,
+		"sig_arm_accel": sig_arm_accel,
+		"sig_arm_gyro_dps": sig_arm_gyro_dps,
+		"arm_observer_tau": arm_observer_tau,
+		"encoder_rate_tau": encoder_rate_tau,
+		"sig_gyro_dps": sig_gyro_dps,
+		"sig_accel": sig_accel,
+		"vib_accel": 0.0,
+		"vib_f_hover": 0.0,
+		"sig_att_deg": sig_att_deg,
+		"sig_relative_angle_deg": sig_enc_deg,
+		"encoder_lsb_deg": enc_lsb_deg,
+		"lat_imu_ms": lat_imu_ms,
+		"lat_attitude_ms": lat_ekf_att_ms,
+		"lat_velocity_ms": lat_ekf_vel_ms,
+		"lat_position_ms": lat_ekf_pos_ms,
+		"lat_arm_ms": lat_arm_ms,
+		"lat_arm_imu_ms": lat_arm_ang_imu_ms,
+		"mass": MASS,
+		"gravity": GRAVITY,
+		"arm_count": 3,
+	})
 	if sensor_noise_enabled:
+		var delays := sensor_model.latency_summary()
 		print("[sensor3] model ON seed=%d lat(imu/att/vel/pos/arm/arm_imu)=%d/%d/%d/%d/%d/%d ticks" % [
-			sensor_seed, _d_imu, _d_att, _d_vel, _d_pos, _d_arm, _d_arm_imu])
-
-
-func _sensed_state(truth: Dictionary, dt: float) -> Dictionary:
-	var g := sensor_rng
-	var d2r := deg_to_rad(1.0)
-
-	_gyro_bias += Vector3(g.randfn(), g.randfn(), g.randfn()) * (0.5 * d2r / sqrt(3600.0)) * sqrt(dt)
-	var gyro_n: Vector3 = truth["gyro"] + _gyro_bias + Vector3(g.randfn(), g.randfn(), g.randfn()) * (sig_gyro_dps * d2r)
-	var accel_n: Vector3 = truth["accel_ef"] + Vector3(g.randfn(), g.randfn(), g.randfn()) * sig_accel
-	var quat_n: Quaternion = (truth["quat"] as Quaternion) * Quaternion.from_euler(
-		Vector3(g.randfn(), g.randfn(), g.randfn()) * (sig_att_deg * d2r))
-	var vel_n: Vector3 = truth["vel_ned"] + Vector3(g.randfn(), g.randfn(), g.randfn()) * sig_vel
-	if sensor_pos_drift:
-		_pos_drift += Vector3(g.randfn(), 0.0, g.randfn()) * pos_drift_rate * sqrt(dt)
-	var pos_n: Vector3 = truth["pos_ned"] + _pos_drift + Vector3(g.randfn(), g.randfn(), g.randfn()) * sig_pos
-
-	# link1 (proximal): 2xIMU fused angle + clean differential-gyro rate
-	var th0: float = float(truth["theta0"]) + g.randfn() * (sig_theta0_deg * d2r)
-	var td0: float = float(truth["tdot0"]) + g.randfn() * (sig_thetadot0_dps * d2r)
-	# joints 2 and 3: magnetic encoders OVER each joint -> RELATIVE angle (quantized + noise).
-	# link2 = link1 + phi2 ; link3 = link2 + phi3 -> both inherit link1's IMU noise + 8 ms latency.
-	var lsb := deg_to_rad(enc_lsb_deg)
-	var phi2_true: float = float(truth["theta1"]) - float(truth["theta0"])
-	var phi3_true: float = float(truth["theta2"]) - float(truth["theta1"])
-	var phi2: float = (round(phi2_true / lsb) * lsb if lsb > 0.0 else phi2_true) + g.randfn() * (sig_enc_deg * d2r)
-	var phi3: float = (round(phi3_true / lsb) * lsb if lsb > 0.0 else phi3_true) + g.randfn() * (sig_enc_deg * d2r)
-	var phid2: float = (float(truth["tdot1"]) - float(truth["tdot0"])) + g.randfn() * (sig_encdot_dps * d2r)
-	var phid3: float = (float(truth["tdot2"]) - float(truth["tdot1"])) + g.randfn() * (sig_encdot_dps * d2r)
-
-	var snap := {
-		"accel_ef": accel_n, "gyro": gyro_n, "quat": quat_n, "vel_ned": vel_n, "pos_ned": pos_n,
-		"theta0": th0, "phi2": phi2, "phi3": phi3, "tdot0": td0, "phid2": phid2, "phid3": phid3,
-	}
-	if not _sensor_seeded:
-		for i in range(_sb_len):
-			_hist[i] = snap.duplicate()
-		_sensor_seeded = true
-	_hist[_sb_idx] = snap
-
-	var th0r: float = _read_ch("theta0", _d_arm_imu)
-	var td0r: float = _read_ch("tdot0", _d_arm)
-	var phi2r: float = _read_ch("phi2", _d_arm)
-	var phi3r: float = _read_ch("phi3", _d_arm)
-	var phid2r: float = _read_ch("phid2", _d_arm)
-	var phid3r: float = _read_ch("phid3", _d_arm)
-	var out := {
-		"accel_ef": _read_ch("accel_ef", _d_imu), "gyro": _read_ch("gyro", _d_imu),
-		"quat": _read_ch("quat", _d_att), "vel_ned": _read_ch("vel_ned", _d_vel),
-		"pos_ned": _read_ch("pos_ned", _d_pos),
-		"theta0": th0r, "tdot0": td0r,
-		"theta1": th0r + phi2r,          "tdot1": td0r + phid2r,
-		"theta2": th0r + phi2r + phi3r,  "tdot2": td0r + phid2r + phid3r,
-	}
-	_sb_idx = (_sb_idx + 1) % _sb_len
-	return out
-
-
-func _read_ch(key: String, depth: int):
-	var ri := (_sb_idx - depth + _sb_len) % _sb_len
-	return (_hist[ri] as Dictionary)[key]
+			sensor_seed, delays[0], delays[1], delays[2], delays[3], delays[4], delays[5]])
 
 
 # ---- plant (byte-identical to main.gd) ----
 func _apply_motor_lag(dt: float) -> void:
-	var alpha := 1.0 - exp(-dt / MOTOR_TAU)
-	for i in range(8):
-		motor_thrust[i] += (motor_cmd[i] - motor_thrust[i]) * alpha
+	MOTOR_DYNAMICS_SCRIPT.apply_first_order_lag(motor_thrust, motor_cmd, dt, MOTOR_TAU)
 
 
 func _pwm_to_thrust(pwm: int) -> float:
-	var x := clampf((float(pwm) - 1000.0) / 1000.0, 0.0, 1.0)
-	return T_MAX * ((1.0 - THRUST_EXPO) * x + THRUST_EXPO * x * x)
+	return MOTOR_DYNAMICS_SCRIPT.pwm_to_thrust(pwm, T_MAX, THRUST_EXPO)
 
 
 func _apply_forces() -> void:
-	var basis := drone.global_transform.basis
-	for i in range(8):
-		var T: float = motor_thrust[i]
-		if T == 0.0:
-			continue
-		drone.apply_force(basis * (motor_dir[i] * T), basis * motor_pos[i])
-		drone.apply_torque(basis * (motor_dir[i] * (motor_spin[i] * K_M * T)))
+	VEHICLE_PLANT_SCRIPT.apply_motor_forces(
+		drone, motor_pos, motor_dir, motor_spin, motor_thrust, K_M
+	)
 
 
 func _ground_clamp() -> void:
-	on_ground = drone.global_position.y <= 0.0
-	if on_ground:
-		var v := drone.linear_velocity
-		if v.y < 0.0:
-			v.y = 0.0
-		v.x *= 0.8
-		v.z *= 0.8
-		drone.linear_velocity = v
-		var t := drone.global_transform
-		t.origin.y = 0.0
-		drone.global_transform = t
+	on_ground = VEHICLE_PLANT_SCRIPT.clamp_to_ground(drone)
 
 
 # ---- arms ----
 func _setup_arms() -> void:
 	var bodies := [$Arm, $Arm2, $Arm3]
 	var pivots := [$Pivot, $Pivot2, $Pivot3]
-	for i in range(bodies.size()):
-		if i < n_arms:
-			arm_bodies.append(bodies[i])
-			arm_prev_theta.append(0.0)
-			arm_has_prev.append(false)
-		else:
-			pivots[i].node_a = NodePath("")
-			pivots[i].node_b = NodePath("")
-			pivots[i].queue_free()
-			bodies[i].queue_free()
+	pendulum_chain.configure(bodies, pivots, n_arms)
+	arm_bodies = pendulum_chain.bodies
 	print("[arms3] %d series pendulum link(s) attached" % n_arms)
 
 
 func _update_pendulum(delta: float) -> void:
-	for i in range(3):
-		arm_theta[i] = 0.0
-		arm_theta_dot[i] = 0.0
-	for i in range(n_arms):
-		var rod := arm_bodies[i].global_transform.basis * Vector3(0, -1, 0)   # pivot->bob (world)
-		var theta := atan2(rod.x, -rod.y)                                      # 0 = straight down, + toward +X
-		var dtheta := 0.0
-		if arm_has_prev[i]:
-			dtheta = wrapf(theta - arm_prev_theta[i], -PI, PI) / maxf(delta, 1e-6)
-		arm_prev_theta[i] = theta
-		arm_has_prev[i] = true
-		arm_theta[i] = theta
-		arm_theta_dot[i] = dtheta
+	var measurement := pendulum_chain.sample(delta, arm_theta.size())
+	arm_theta = measurement["angles"]
+	arm_theta_dot = measurement["rates"]
 
 
 # ---- balance ----
@@ -510,30 +432,22 @@ func _balance_setup() -> void:
 	print("[bal3] BALANCE_ONBOARD active: %d link(s), alt=%.1f m, init=(%.2f,%.2f,%.2f) deg, noise=%d" % [
 		n_arms, balance_alt, balance_init[0], balance_init[1], balance_init[2], int(sensor_noise_enabled)])
 
-	var cam := $Camera3D
-	cam.current = true
-	cam.global_position = Vector3(0.0, balance_alt + 0.9, 4.2)
-	cam.look_at(Vector3(0.0, balance_alt + 0.9, 0.0), Vector3.UP)
-	var cols := [Color(0.90, 0.20, 0.20), Color(0.25, 0.50, 1.00), Color(0.30, 0.85, 0.35)]
-	for i in range(n_arms):
-		_bal_colour_link(arm_bodies[i], cols[i])
+	SCENARIO_VISUALS_SCRIPT.frame_camera(
+		$Camera3D,
+		Vector3(0.0, balance_alt + 0.9, 4.2),
+		Vector3(0.0, balance_alt + 0.9, 0.0)
+	)
+	SCENARIO_VISUALS_SCRIPT.colour_links(arm_bodies)
 
-	# live top strip-charts (same as main.gd's): TOP = commanded a_cmd vs the REAL realised lateral
-	# accel (shows the ModeAccel3 loop + its chatter); BELOW = the link angles. Fed each tick in _bal_record.
-	bal_graph_u = load("res://accel_graph.gd").new()      # 2-series (cmd vs real)
-	bal_graph_ang = load("res://accel_graph3.gd").new()   # 3-series (three links)
-	for gg in [bal_graph_u, bal_graph_ang]:
-		gg.anchor_left = 0.0; gg.anchor_top = 0.0; gg.anchor_right = 1.0; gg.anchor_bottom = 0.0
-		gg.offset_left = 10.0; gg.offset_right = -10.0
-		$CanvasLayer.add_child(gg)
-		gg.setup(2.0)
-	bal_graph_u.offset_top = 8.0;     bal_graph_u.offset_bottom = 150.0
-	bal_graph_ang.offset_top = 158.0; bal_graph_ang.offset_bottom = 300.0
-	bal_graph_u.title = "lateral a_x [m/s^2]  (a_cmd vs REAL ModeAccel3 realised)"
-	bal_graph_ang.title = "link angles from upright [deg]"
-	bal_graph_ang.label1 = "link1 (0.7 m)"
-	bal_graph_ang.label2 = "link2 (0.6 m)"
-	bal_graph_ang.label3 = "link3 (0.6 m)"
+	# One shallow lateral chart for normal footage; RESPONSE_VIDEO=1 adds vertical tracking beside it.
+	var graphs := SCENARIO_VISUALS_SCRIPT.create_recording_graphs(
+		$CanvasLayer,
+		graph_window_seconds,
+		response_video_overlay
+	)
+	bal_graph_u = graphs[0]
+	bal_graph_vertical = graphs[1] if graphs.size() > 1 else null
+	bal_angle_readout = SCENARIO_VISUALS_SCRIPT.create_angle_readout($CanvasLayer)
 
 
 # TRUTH |angle from up| of link i [deg]; 0 = upright.
@@ -548,16 +462,39 @@ func _link_signed_deg(i: int) -> float:
 	return wrapf(atan2(rod.x, rod.y), -PI, PI) * 180.0 / PI
 
 
-func _bal_record(delta: float, a_cmd: float) -> void:
+func _push_analysis_samples(
+	sample_time: float,
+	lateral_command: float,
+	vertical_command: float
+) -> void:
+	if not bal_graph_u:
+		return
+	var lateral_realised := _imu_accel_world.x
+	var angles: Array[float] = []
+	for index in range(n_arms):
+		angles.append(_link_signed_deg(index))
+	bal_graph_u.push_sample(sample_time, lateral_command, lateral_realised)
+	SCENARIO_VISUALS_SCRIPT.update_angle_readout(
+		bal_angle_readout,
+		angles,
+		_overlay_balance_on,
+		_overlay_vehicle_command,
+		_overlay_reaction_ff_on
+	)
+	if bal_graph_vertical:
+		bal_graph_vertical.push_sample(
+			sample_time,
+			vertical_command,
+			_imu_accel_world.y - GRAVITY
+		)
+
+
+func _bal_record(delta: float, a_cmd: float, vertical_command: float) -> void:
 	for i in range(n_arms):
 		_bal_max[i] = maxf(_bal_max[i], _link_up_deg(i))
 	_bal_sum_cmd2 += a_cmd * a_cmd
 	_bal_n += 1
-	if bal_graph_u:
-		bal_graph_u.push_sample(_bal_t, a_cmd, _imu_accel_world.x)   # cmd vs REAL realised lateral accel
-		bal_graph_ang.push_sample(_bal_t, _link_signed_deg(0),
-			_link_signed_deg(1) if n_arms >= 2 else 0.0,
-			_link_signed_deg(2) if n_arms >= 3 else 0.0)             # signed link angles from up
+	_push_analysis_samples(_bal_t, a_cmd, vertical_command)
 	if _bal_n % 100 == 0:
 		var eb := drone.global_transform.basis.get_euler()
 		print("[bal3] t=%5.2f up=(%.2f,%.2f,%.2f) lat=%+5.2f fwd=%+5.2f alt=%5.2f pitch=%+4.1f a_cmd=%+6.2f sat=%d" % [
@@ -572,6 +509,10 @@ func _bal_record(delta: float, a_cmd: float) -> void:
 
 func _bal_finish() -> void:
 	_bal_done = true
+	if bal_graph_u:
+		bal_graph_u.add_event(_bal_t, "arm release")
+		if bal_graph_vertical:
+			bal_graph_vertical.add_event(_bal_t, "arm release")
 	var f := [_link_up_deg(0), _link_up_deg(1) if n_arms >= 2 else 0.0, _link_up_deg(2) if n_arms >= 3 else 0.0]
 	var rms := sqrt(_bal_sum_cmd2 / float(max(1, _bal_n)))
 	var passed := true
@@ -603,23 +544,6 @@ func _bal_finish() -> void:
 	# holds station once the triple drops (it quits itself after ~120 s in _service_native).
 	if DisplayServer.get_name() == "headless" and not passed:
 		get_tree().quit(2)
-
-
-func _bal_colour_link(arm: Node3D, col: Color) -> void:
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = col
-	var rod := arm.get_node_or_null("Rod")
-	if rod:
-		rod.material_override = mat
-	var bob := arm.get_node_or_null("Bob")
-	if bob:
-		var mi := MeshInstance3D.new()
-		var sph := SphereMesh.new()
-		sph.radius = 0.05
-		sph.height = 0.10
-		mi.mesh = sph
-		mi.material_override = mat
-		bob.add_child(mi)
 
 
 # ---- reaction-FF truth validation: TRUE R = sum_i m_i (g_vec - a_bob_i) vs the 3x3 FORMULA ----
@@ -707,45 +631,21 @@ func _solve3(A: Array, b: Array) -> Array:
 
 # ---- headless auto-test + grader (reaction-FF-with-swing validation, like Packet C) ----
 func _auto_drive() -> void:
-	var alt := drone.global_position.y
-	match auto_phase:
-		0:
-			park = false
-			lat_level = 0
-			vert_level = 1
-			if alt > 25.0:
-				auto_phase = 1
-				auto_t0 = sim_time
-				print("[auto3] airborne (alt=%.1f); starting profile" % alt)
-		1:
-			park = false
-			var tp := sim_time - auto_t0
-			var active := false
-			for step in auto_profile:
-				if tp < float(step[0]):
-					lat_level = int(step[1])
-					vert_level = int(step[2])
-					active = true
-					break
-			if not active:
-				auto_phase = 2
-				print("[auto3] profile complete at t=%.1f" % tp)
-		2:
-			park = true
-			lat_level = 0
-			vert_level = 0
+	var command := auto_profile_driver.update(
+		drone.global_position.y,
+		drone.linear_velocity.y,
+		sim_time,
+		auto_profile,
+		"[auto3]",
+		false
+	)
+	park = command["park"]
+	lat_level = command["lateral_level"]
+	vert_level = command["vertical_level"]
 
 
 func _grade(delta: float) -> void:
-	var accel_world := (drone.linear_velocity - _grade_prev_vel) / maxf(delta, 1e-6)
-	_grade_prev_vel = drone.linear_velocity
-	if on_ground:
-		return
-	var a_lat_cmd := lat_level / 4.0 * 12.0
-	var a_up_cmd := vert_level / 3.0 * GRAVITY
-	_grade_t += delta
-	if _grade_t >= 0.25 and (auto_test or not balance_onboard):
-		_grade_t = 0.0
-		print("[grade3] lat cmd=%6.2f true=%6.2f err=%+5.2f | up cmd=%6.2f true=%6.2f err=%+5.2f | lat_pos=%+7.2f" % [
-			a_lat_cmd, accel_world.x, accel_world.x - a_lat_cmd,
-			a_up_cmd, accel_world.y, accel_world.y - a_up_cmd, drone.global_position.x])
+	acceleration_grader.update(
+		drone, delta, on_ground, sim_time, lat_level, vert_level,
+		12.0, GRAVITY, false, auto_test or not balance_onboard
+	)
