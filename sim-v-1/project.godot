@@ -18,12 +18,16 @@ config/icon="res://icon.svg"
 
 [display]
 
-window/size/mode=2
+window/size/viewport_width=2560
+window/size/viewport_height=1440
+window/stretch/mode="canvas_items"
 window/vsync/vsync_mode=0
 
 [editor]
 
-movie_writer/movie_file="/home/omicrontheta/03_Projects/inverted-pendulum-drone/sim-v-1/.ogv"
+movie_writer/video_quality=1.0
+movie_writer/ogv/encoding_speed=1
+movie_writer/movie_file="/home/omicrontheta/03_Projects/inverted-pendulum-drone/sim-v-1/recording.ogv"
 
 [physics]
 
