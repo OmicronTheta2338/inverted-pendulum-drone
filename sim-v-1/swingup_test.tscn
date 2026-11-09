@@ -1,7 +1,10 @@
 [gd_scene format=3 uid="uid://47nst8w32tqe"]
 
-[ext_resource type="Script" path="res://swingup_test.gd" id="1_swing"]
-[ext_resource type="Script" path="res://accel_graph.gd" id="2_graph"]
+[ext_resource type="Script" uid="uid://c6scvpmx44b6e" path="res://swingup_test.gd" id="1_swing"]
+[ext_resource type="Script" uid="uid://chsh7a0t48jgh" path="res://accel_graph.gd" id="2_graph"]
+
+[sub_resource type="BoxMesh" id="BoxMesh_drone"]
+size = Vector3(0.35, 0.06, 0.35)
 
 [sub_resource type="SphereShape3D" id="SphereShape3D_bob"]
 radius = 0.02
@@ -11,58 +14,55 @@ top_radius = 0.008
 bottom_radius = 0.008
 height = 0.7
 
-[sub_resource type="BoxMesh" id="BoxMesh_drone"]
-size = Vector3(0.35, 0.06, 0.35)
-
-[node name="SwingupTest" type="Node3D"]
+[node name="SwingupTest" type="Node3D" unique_id=1458806760]
 script = ExtResource("1_swing")
 
-[node name="Drone" type="RigidBody3D" parent="."]
+[node name="Drone" type="RigidBody3D" parent="." unique_id=1662540725]
 mass = 0.8
 center_of_mass_mode = 1
 inertia = Vector3(0.01616, 0.04272, 0.02674)
 
-[node name="DroneMesh" type="MeshInstance3D" parent="Drone"]
+[node name="DroneMesh" type="MeshInstance3D" parent="Drone" unique_id=1392830367]
 mesh = SubResource("BoxMesh_drone")
 
-[node name="Arm" type="RigidBody3D" parent="."]
+[node name="Arm" type="RigidBody3D" parent="." unique_id=1096968351]
+collision_layer = 0
+collision_mask = 0
 mass = 0.1
 can_sleep = false
 linear_damp_mode = 1
-linear_damp = 0.0
 angular_damp_mode = 1
-angular_damp = 0.0
-collision_layer = 0
-collision_mask = 0
 
-[node name="Bob" type="CollisionShape3D" parent="Arm"]
+[node name="Bob" type="CollisionShape3D" parent="Arm" unique_id=1885172049]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.7, 0)
 shape = SubResource("SphereShape3D_bob")
 
-[node name="Rod" type="MeshInstance3D" parent="Arm"]
+[node name="Rod" type="MeshInstance3D" parent="Arm" unique_id=887432269]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.35, 0)
 mesh = SubResource("CylinderMesh_rod")
 
-[node name="Pivot" type="HingeJoint3D" parent="."]
+[node name="Pivot" type="HingeJoint3D" parent="." unique_id=1973458340]
 node_a = NodePath("../Drone")
 node_b = NodePath("../Arm")
 
-[node name="Camera3D" type="Camera3D" parent="."]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.0, 2.8)
+[node name="Camera3D" type="Camera3D" parent="." unique_id=797339342]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 2.8)
 
-[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=432744108]
 transform = Transform3D(1, 0, 0, 0, 0.7071, 0.7071, 0, -0.7071, 0.7071, 0, 3, 0)
 
-[node name="CanvasLayer" type="CanvasLayer" parent="."]
+[node name="CanvasLayer" type="CanvasLayer" parent="." unique_id=1981736021]
 
-[node name="Status" type="Label" parent="CanvasLayer"]
+[node name="Status" type="Label" parent="CanvasLayer" unique_id=132798389]
 offset_left = 12.0
 offset_top = 12.0
 offset_right = 560.0
 offset_bottom = 240.0
 theme_override_font_sizes/font_size = 18
 
-[node name="AccelGraph" type="Control" parent="CanvasLayer"]
+[node name="AccelGraph" type="Control" parent="CanvasLayer" unique_id=1288114334]
+layout_mode = 3
+anchors_preset = 12
 anchor_top = 1.0
 anchor_right = 1.0
 anchor_bottom = 1.0
