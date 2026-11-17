@@ -1,0 +1,41 @@
+run_id: "YYYY-MM-DD_platform_experiment_configuration_seed-NNN"
+captured_utc: "YYYY-MM-DDTHH:MM:SSZ"
+evidence_class: "simulation | bench | flight"
+purpose: ""
+
+repository:
+  commit: ""
+  branch: ""
+  working_tree_clean: false
+  diff_or_notes: ""
+
+runtime:
+  host: ""
+  os: ""
+  executable: ""
+  executable_version: ""
+  scene_or_binary: ""
+  exact_command: ""
+
+configuration:
+  seed: null
+  sample_rate_hz: null
+  controller_rate_hz: 400
+  environment_overrides: {}
+  physical_or_sim_parameters: {}
+
+protocol:
+  initial_condition: ""
+  commanded_input: ""
+  disturbance: ""
+  duration_s: null
+  pass_criteria: ""
+  abort_criteria: ""
+
+outputs:
+  raw_files: []
+  result: "PASS | FAIL | UNGRADED"
+  summary_metrics: {}
+
+notes: ""
+
